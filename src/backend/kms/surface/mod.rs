@@ -97,6 +97,7 @@ use std::{
     time::Duration,
 };
 
+mod commands;
 mod tearing;
 mod timings;
 pub use self::timings::Timings;
@@ -119,7 +120,7 @@ pub struct Surface {
     overlay_plane_formats: Option<FormatSet>,
 
     loop_handle: LoopHandle<'static, State>,
-    thread_command: Sender<ThreadCommand>,
+    thread_command: commands::CommandSender,
     thread_token: RegistrationToken,
     thread: Option<JoinHandle<()>>,
 
@@ -250,6 +251,8 @@ impl Surface {
         startup_done: Arc<AtomicBool>,
     ) -> Result<Self> {
         let (tx, rx) = channel::<ThreadCommand>();
+        let redraw_pending = Arc::new(AtomicBool::new(false));
+        let tx = commands::CommandSender::new(tx, redraw_pending.clone());
         let (tx2, rx2) = channel::<SurfaceCommand>();
         let active = Arc::new(AtomicBool::new(false));
 
@@ -268,6 +271,7 @@ impl Surface {
                     screen_filter,
                     tx2,
                     rx,
+                    redraw_pending,
                     startup_done,
                 ) {
                     error!("Surface thread crashed: {}", err);
@@ -497,6 +501,7 @@ fn surface_thread(
     screen_filter: ScreenFilter,
     thread_sender: Sender<SurfaceCommand>,
     thread_receiver: Channel<ThreadCommand>,
+    redraw_pending: Arc<AtomicBool>,
     startup_done: Arc<AtomicBool>,
 ) -> Result<()> {
     let name = output.name();
@@ -588,6 +593,9 @@ fn surface_thread(
                 state.on_vblank(metadata);
             }
             Event::Msg(ThreadCommand::ScheduleRender) => {
+                // Clear before processing: input or client commits arriving
+                // during this redraw must be able to enqueue the next one.
+                redraw_pending.swap(false, Ordering::AcqRel);
                 if !startup_done.load(Ordering::SeqCst) {
                     return;
                 }
