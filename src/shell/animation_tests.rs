@@ -108,3 +108,19 @@ fn shared_overview_transitions_still_redraw_both_outputs() {
         assert!(!shell.output_animations_going(output));
     }
 }
+
+#[test]
+fn querying_another_output_does_not_consume_dirty_workspace_damage() {
+    let (shell, [game, desktop], _display) = shell_with_outputs();
+    let workspace = &shell.workspaces.sets[&desktop].workspaces[0];
+    workspace.dirty.store(true, Ordering::SeqCst);
+    assert!(!shell.output_animations_going(&game));
+    assert!(workspace.dirty.load(Ordering::SeqCst));
+    assert!(shell.output_animations_going(&desktop));
+    assert!(!workspace.dirty.load(Ordering::SeqCst));
+    assert!(!shell.output_animations_going(&desktop));
+
+    // A new invalidation after the previous frame must schedule another frame.
+    workspace.dirty.store(true, Ordering::SeqCst);
+    assert!(shell.output_animations_going(&desktop));
+}
