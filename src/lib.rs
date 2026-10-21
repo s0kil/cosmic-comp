@@ -198,6 +198,13 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
             return;
         }
 
+        // Deliver the whole input batch before housekeeping can wait on the
+        // shell or refresh windows. Keep the final flush below for events those
+        // routines generate, and avoid an extra flush on input-free iterations.
+        state
+            .input_event_flush
+            .flush(&mut state.common.display_handle);
+
         // trigger routines
         let clients = state.common.shell.write().update_animations();
         {

@@ -94,6 +94,7 @@ use std::{
 };
 
 pub mod actions;
+pub(crate) mod event_flush;
 pub mod gestures;
 pub mod tablet_emu;
 
@@ -223,6 +224,10 @@ impl State {
     ) where
         <B as InputBackend>::Device: 'static,
     {
+        // Also covers paths that return early after forwarding input, such as
+        // a locked pointer or an IME keyboard bypass.
+        self.input_event_flush.request();
+
         // An input device going away is not user activity, e.g. a wireless keyboard
         // dropping its link when it sleeps, so it must not power displays back on.
         // Device additions still wake: after a system resume the re-enumerated
@@ -382,7 +387,9 @@ impl State {
             InputEvent::PointerMotion { event, .. } => {
                 use smithay::backend::input::PointerMotionEvent as _;
 
-                let shell = self.common.shell.write();
+                // Target and constraint lookup only read the shell. In particular,
+                // a locked pointer need not wait for renderers holding read locks.
+                let shell = self.common.shell.read();
                 if let Some(seat) = shell
                     .seats
                     .for_device(&event.device(), &backend_id)

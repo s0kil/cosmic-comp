@@ -227,6 +227,7 @@ pub struct State {
     pub ready: Once,
     pub last_refresh: LastRefresh,
     pub kiosk_command: Option<Command>,
+    pub(crate) input_event_flush: crate::input::event_flush::InputEventFlush,
 }
 smithay::delegate_dispatch2!(State);
 
@@ -848,6 +849,7 @@ impl State {
             ready: Once::new(),
             last_refresh: LastRefresh::None,
             kiosk_command,
+            input_event_flush: Default::default(),
         }
     }
 
