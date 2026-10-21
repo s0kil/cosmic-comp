@@ -100,16 +100,48 @@ pub fn client_compositor_state(client: &Client) -> &CompositorClientState {
 struct FrametimeData {
     last_commit: Option<Time<Monotonic>>,
     last_diffs: VecDeque<Duration>,
+    // A u128 holds the sum of the entire window even if individual samples
+    // approach Duration::MAX. Saturating the stored sum would lose information
+    // when an old sample is evicted.
+    last_diffs_total_ns: u128,
     estimation: Duration,
 }
+
+const FRAME_TIME_WINDOW: usize = 100;
 
 impl Default for FrametimeData {
     fn default() -> Self {
         FrametimeData {
             last_commit: None,
-            last_diffs: VecDeque::with_capacity(100),
+            last_diffs: VecDeque::with_capacity(FRAME_TIME_WINDOW),
+            last_diffs_total_ns: 0,
             estimation: Duration::MAX,
         }
+    }
+}
+
+impl FrametimeData {
+    fn record_commit(&mut self, now: Time<Monotonic>) {
+        if let Some(last) = self.last_commit.replace(now) {
+            self.record_interval(Time::elapsed(&last, now));
+        }
+    }
+
+    fn record_interval(&mut self, diff: Duration) {
+        if self.last_diffs.len() == FRAME_TIME_WINDOW {
+            self.last_diffs_total_ns -= self.last_diffs.pop_front().unwrap().as_nanos();
+        }
+        self.last_diffs.push_back(diff);
+        self.last_diffs_total_ns += diff.as_nanos();
+
+        // Preserve the old saturating-sum average, without scanning up to 100
+        // samples on every commit while holding the surface's state lock.
+        let average_ns =
+            self.last_diffs_total_ns.min(Duration::MAX.as_nanos()) / self.last_diffs.len() as u128;
+        self.estimation = Duration::new(
+            (average_ns / 1_000_000_000) as u64,
+            (average_ns % 1_000_000_000) as u32,
+        );
     }
 }
 
@@ -243,19 +275,7 @@ impl CompositorHandler for State {
                     .get_or_insert_threadsafe::<Mutex<FrametimeData>, _>(Default::default)
                     .lock()
                     .unwrap();
-                if let Some(ref last) = data.last_commit {
-                    let diff = Time::elapsed(last, now);
-                    data.last_diffs.push_back(diff);
-                    if data.last_diffs.len() > 100 {
-                        data.last_diffs.pop_front();
-                    }
-                    data.estimation = data
-                        .last_diffs
-                        .iter()
-                        .fold(Duration::ZERO, |acc, new| acc.saturating_add(*new))
-                        / (data.last_diffs.len() as u32);
-                }
-                data.last_commit = Some(now);
+                data.record_commit(now);
             });
         });
     }
@@ -435,5 +455,58 @@ impl State {
         };
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_commit_does_not_invent_a_frame_interval() {
+        let mut data = FrametimeData::default();
+        data.record_commit(Duration::from_secs(1).into());
+        assert_eq!(data.estimation, Duration::MAX);
+        assert!(data.last_diffs.is_empty());
+        data.record_commit(Duration::from_millis(1005).into());
+        assert_eq!(data.estimation, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn rolling_average_matches_original_across_evictions() {
+        let mut data = FrametimeData::default();
+        let mut reference = VecDeque::new();
+        // Include duplicate timestamps, long pauses and changing frame rates.
+        for i in 0..1000 {
+            let diff = match i % 4 {
+                0 => Duration::ZERO,
+                1 => Duration::from_secs(30),
+                _ => Duration::from_nanos(i * 91_013),
+            };
+            reference.push_back(diff);
+            if reference.len() > FRAME_TIME_WINDOW {
+                reference.pop_front();
+            }
+            let expected = reference
+                .iter()
+                .copied()
+                .fold(Duration::ZERO, Duration::saturating_add)
+                / reference.len() as u32;
+            data.record_interval(diff);
+            assert_eq!(data.estimation, expected, "interval {i}");
+            assert!(data.last_diffs.len() <= FRAME_TIME_WINDOW);
+        }
+    }
+
+    #[test]
+    fn saturated_average_recovers_after_outliers_are_evicted() {
+        let mut data = FrametimeData::default();
+        data.record_interval(Duration::MAX);
+        data.record_interval(Duration::MAX);
+        assert_eq!(data.estimation, Duration::MAX / 2);
+        for _ in 0..FRAME_TIME_WINDOW {
+            data.record_interval(Duration::from_millis(4));
+        }
+        assert_eq!(data.estimation, Duration::from_millis(4));
     }
 }
