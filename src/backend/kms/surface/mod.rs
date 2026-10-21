@@ -882,7 +882,12 @@ impl SurfaceThreadState {
             QueueState::WaitingForEstimatedVBlankAndQueued { .. } => unreachable!(),
         };
 
-        if redraw_needed || self.shell.read().animations_going() {
+        if redraw_needed
+            || self
+                .shell
+                .read()
+                .output_animations_going(self.mirroring.as_ref().unwrap_or(&self.output))
+        {
             let vblank_frame = tracy_client::Client::running()
                 .unwrap()
                 .non_continuous_frame(self.vblank_frame_name);
@@ -909,7 +914,12 @@ impl SurfaceThreadState {
 
         self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
 
-        if force || self.shell.read().animations_going() {
+        if force
+            || self
+                .shell
+                .read()
+                .output_animations_going(self.mirroring.as_ref().unwrap_or(&self.output))
+        {
             self.queue_redraw(false);
         }
         self.send_frame_callbacks();
@@ -1040,8 +1050,8 @@ impl SurfaceThreadState {
 
         let (has_active_fullscreen, fullscreen_drives_refresh_rate, animations_going) = {
             let shell = self.shell.read();
-            let animations_going = shell.animations_going();
             let output = self.mirroring.as_ref().unwrap_or(&self.output);
+            let animations_going = shell.output_animations_going(output);
             if let Some((_, workspace)) = shell.workspaces.active(output) {
                 let seat = shell.seats.last_active();
                 if let Some(fullscreen_surface) = workspace.get_fullscreen(seat) {

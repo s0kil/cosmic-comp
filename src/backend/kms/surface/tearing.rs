@@ -18,7 +18,7 @@ use smithay::{
 pub(super) fn requested(shell: &Shell, output: &Output) -> bool {
     if !shell.allow_tearing
         || shell.session_lock.is_some()
-        || shell.animations_going()
+        || shell.output_animations_going(output)
         || shell.zoom_state().is_some()
     {
         return false;

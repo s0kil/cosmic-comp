@@ -211,10 +211,11 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
 
         {
             let shell = state.common.shell.read();
-            if shell.animations_going() {
-                for output in shell.outputs().cloned().collect::<Vec<_>>().into_iter() {
-                    state.backend.schedule_render(&output);
-                }
+            for output in shell
+                .outputs()
+                .filter(|output| shell.output_animations_going(output))
+            {
+                state.backend.schedule_render(output);
             }
         }
 

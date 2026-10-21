@@ -97,6 +97,8 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+mod animation_tests;
 pub mod element;
 pub mod focus;
 pub mod grabs;
@@ -2435,34 +2437,36 @@ impl Shell {
             .unwrap_or_else(Rectangle::default)
     }
 
-    pub fn animations_going(&self) -> bool {
-        self.workspaces.sets.values().any(|set| {
+    /// Whether this output needs another frame to advance shell animations.
+    /// Overview and resize transitions remain shared: operations such as a
+    /// keyboard swap can affect more than the focused output.
+    pub fn output_animations_going(&self, output: &Output) -> bool {
+        self.workspaces.sets.get(output).is_some_and(|set| {
             set.previously_active
                 .as_ref()
                 .is_some_and(|(_, delta)| delta.is_animating())
                 || set.sticky_layer.animations_going()
+                // Include outgoing and hidden workspaces: their final animation
+                // frame can still need rendering or cleanup.
+                || set.workspaces.iter().any(|workspace| workspace.animations_going())
         }) || !matches!(
             self.overview_mode,
             OverviewMode::None | OverviewMode::Active(_)
         ) || !matches!(
             self.resize_mode,
             ResizeMode::None | ResizeMode::Active(_, _)
-        ) || self
-            .workspaces
-            .spaces()
-            .any(|workspace| workspace.animations_going())
-            || self.zoom_state.as_ref().is_some_and(|_| {
-                self.outputs().any(|o| {
-                    o.user_data()
-                        .get::<Mutex<OutputZoomState>>()
-                        .is_some_and(|state| state.lock().unwrap().is_animating())
-                })
-            })
-            || self.seats.iter().any(|seat| {
-                seat.user_data()
+        ) || self.zoom_state.as_ref().is_some_and(|_| {
+            output
+                .user_data()
+                .get::<Mutex<OutputZoomState>>()
+                .is_some_and(|state| state.lock().unwrap().is_animating())
+        }) || self.seats.iter().any(|seat| {
+            seat.active_output() == *output
+                && seat
+                    .user_data()
                     .get::<crate::backend::render::cursor::CursorState>()
                     .is_some_and(|state| state.lock().unwrap().is_magnifying())
-            })
+        })
     }
 
     pub fn update_animations(&mut self) -> HashMap<ClientId, Client> {
