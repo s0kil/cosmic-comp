@@ -1035,6 +1035,18 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                     state.common.config.cosmic_conf.activation_policy = new;
                 }
             }
+            "allow_tearing" => {
+                let new = get_config::<bool>(&config, "allow_tearing");
+                state.common.config.cosmic_conf.allow_tearing = new;
+                let outputs = {
+                    let mut shell = state.common.shell.write();
+                    shell.allow_tearing = new;
+                    shell.outputs().cloned().collect::<Vec<_>>()
+                };
+                for output in outputs {
+                    state.backend.schedule_render(&output);
+                }
+            }
             "decoration_preference" => {
                 let new = get_config::<DecorationPreference>(&config, "decoration_preference");
                 if new != state.common.config.cosmic_conf.decoration_preference {

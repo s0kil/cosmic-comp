@@ -113,6 +113,9 @@ pub struct CosmicCompConfig {
     pub cursor_shake_to_find: bool,
     pub activation_policy: ActivationPolicy,
     pub decoration_preference: DecorationPreference,
+    /// Allow focused fullscreen Wayland clients to request tearing on supported outputs.
+    /// Disabled by default; adaptive sync takes precedence.
+    pub allow_tearing: bool,
 }
 
 impl Default for CosmicCompConfig {
@@ -153,6 +156,7 @@ impl Default for CosmicCompConfig {
             cursor_shake_to_find: true,
             activation_policy: ActivationPolicy::default(),
             decoration_preference: DecorationPreference::default(),
+            allow_tearing: false,
         }
     }
 }

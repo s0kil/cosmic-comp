@@ -146,5 +146,6 @@ lto = "fat"
 cosmic-protocols = { git = "https://github.com/pop-os//cosmic-protocols", branch = "main" }
 
 [patch.crates-io]
-smithay = { git = "https://github.com/smithay/smithay.git", rev = "8a27023" }
+# Paired tearing implementation; see docs/tearing/README.md for release pinning.
+smithay = { path = "../../Smithay/smithay" }
 smithay-egui = { git = "https://github.com/Smithay/smithay-egui.git", rev = "6511552" }

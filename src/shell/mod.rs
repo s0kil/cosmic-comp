@@ -297,6 +297,7 @@ pub struct Shell {
 
     theme: cosmic::Theme,
     pub active_hint: bool,
+    pub allow_tearing: bool,
     overview_mode: OverviewMode,
     swap_indicator: Option<SwapIndicator>,
     resize_mode: ResizeMode,
@@ -1760,6 +1761,7 @@ impl Shell {
 
             theme,
             active_hint: config.cosmic_conf.active_hint,
+            allow_tearing: config.cosmic_conf.allow_tearing,
             overview_mode: OverviewMode::None,
             swap_indicator: None,
             resize_mode: ResizeMode::None,

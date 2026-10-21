@@ -39,8 +39,8 @@ use smithay::{
         },
         egl::EGLContext,
         renderer::{
-            Bind, Blit, BufferType, Frame, ImportDma, Offscreen, Renderer, RendererSuper, Texture,
-            TextureFilter, buffer_dimensions, buffer_type,
+            Bind, Blit, BufferType, Frame, ImportDma, Offscreen, PresentationMode, Renderer,
+            RendererSuper, Texture, TextureFilter, buffer_dimensions, buffer_type,
             damage::Error as RenderError,
             element::{
                 Element, Kind, RenderElementStates,
@@ -68,10 +68,7 @@ use smithay::{
             timer::{TimeoutAction, Timer},
         },
         drm::control::{connector, crtc},
-        wayland_protocols::wp::{
-            linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
-            presentation_time::server::wp_presentation_feedback,
-        },
+        wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
         wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{Clock, Monotonic, Physical, Point, Rectangle, Transform},
@@ -100,6 +97,7 @@ use std::{
     time::Duration,
 };
 
+mod tearing;
 mod timings;
 pub use self::timings::Timings;
 
@@ -141,6 +139,7 @@ pub struct SurfaceThreadState {
     state: QueueState,
     timings: Timings,
     frame_callback_seq: usize,
+    last_presentation_mode: PresentationMode,
     thread_sender: Sender<SurfaceCommand>,
 
     output: Output,
@@ -540,6 +539,7 @@ fn surface_thread(
         state: QueueState::Idle,
         timings: Timings::new(None, None, false, target_node),
         frame_callback_seq: 0,
+        last_presentation_mode: PresentationMode::VSync,
         thread_sender,
 
         output,
@@ -617,6 +617,7 @@ fn surface_thread(
                 state.vrr_mode = vrr;
             }
             Event::Msg(ThreadCommand::DpmsOff) => {
+                state.last_presentation_mode = PresentationMode::VSync;
                 if let Some(compositor) = state.compositor.as_mut() {
                     if let Err(err) = compositor.with_compositor(|c| c.clear()) {
                         error!("Failed to set DPMS off: {:?}", err);
@@ -667,6 +668,7 @@ fn surface_thread(
 
 impl SurfaceThreadState {
     fn suspend(&mut self, tx: SyncSender<()>) {
+        self.last_presentation_mode = PresentationMode::VSync;
         self.active.store(false, Ordering::SeqCst);
         let _ = self.compositor.take();
 
@@ -689,6 +691,7 @@ impl SurfaceThreadState {
     }
 
     fn resume(&mut self, compositor: GbmDrmOutput) {
+        self.last_presentation_mode = PresentationMode::VSync;
         let (mode, min_hz) = compositor.with_compositor(|c| {
             (
                 c.surface().pending_mode(),
@@ -782,6 +785,16 @@ impl SurfaceThreadState {
         // finish tracy frame
         let _ = self.vblank_frame.take();
 
+        // The hint is only a request. Read the mode KMS actually accepted before
+        // frame_submitted advances the pending frame.
+        let presentation_mode = compositor.with_pending_frame(|frame| {
+            frame.map_or(PresentationMode::VSync, |frame| frame.presentation_mode)
+        });
+        if self.last_presentation_mode != presentation_mode {
+            tracing::debug!(output = %self.output.name(), ?presentation_mode, "Presentation mode changed");
+        }
+        self.last_presentation_mode = presentation_mode;
+
         // mark last frame completed
         if let Ok(Some(Some((mut feedback, frames, estimated_presentation_time)))) =
             compositor.frame_submitted()
@@ -819,26 +832,15 @@ impl SurfaceThreadState {
                 .unwrap()
                 .message(&message, 0);
 
-            let (clock, flags) = if let Some(tp) = presentation_time {
-                (
-                    tp.into(),
-                    wp_presentation_feedback::Kind::Vsync
-                        | wp_presentation_feedback::Kind::HwClock
-                        | wp_presentation_feedback::Kind::HwCompletion,
-                )
-            } else {
-                (
-                    now,
-                    wp_presentation_feedback::Kind::Vsync
-                        | wp_presentation_feedback::Kind::HwCompletion,
-                )
-            };
+            let clock = presentation_time.map(Into::into).unwrap_or(now);
+            let flags = tearing::presentation_flags(presentation_mode, presentation_time.is_some());
 
             let rate = self
                 .output
                 .current_mode()
                 .map(|mode| Duration::from_secs_f64(1_000.0 / mode.refresh as f64));
             let refresh = match rate {
+                _ if presentation_mode == PresentationMode::Async => Refresh::Unknown,
                 Some(rate)
                     if self
                         .compositor
@@ -939,7 +941,18 @@ impl SurfaceThreadState {
         }
 
         let estimated_presentation = self.timings.next_presentation_time(&self.clock);
-        let render_start = self.timings.next_render_time(&self.clock);
+        let immediate = tearing::render_immediately(
+            self.last_presentation_mode,
+            tearing::requested(&self.shell.read(), &self.output)
+                && self.mirroring.is_none()
+                && self.screen_filter.is_noop()
+                && self.vrr_mode == AdaptiveSync::Disabled,
+        );
+        let render_start = if immediate {
+            Duration::ZERO
+        } else {
+            self.timings.next_render_time(&self.clock)
+        };
 
         let timer = if render_start.is_zero() {
             trace!("Running late for frame.");
@@ -955,6 +968,7 @@ impl SurfaceThreadState {
                 if let Err(err) = state.redraw(estimated_presentation) {
                     let name = state.output.name();
                     warn!(?name, "Failed to submit rendering: {:?}", err);
+                    state.last_presentation_mode = PresentationMode::VSync;
                     state.queue_redraw(true);
                 }
                 TimeoutAction::Drop
@@ -991,6 +1005,7 @@ impl SurfaceThreadState {
 
     #[profiling::function]
     fn redraw(&mut self, estimated_presentation: Duration) -> Result<()> {
+        let tearing_requested = tearing::requested(&self.shell.read(), &self.output);
         let Some(compositor) = self.compositor.as_mut() else {
             return Ok(());
         };
@@ -1093,6 +1108,24 @@ impl SurfaceThreadState {
         } else {
             Default::default()
         };
+
+        // The MultiRenderer returns the final target-GPU fence, including any copy.
+        // Keep the normal acquire-fence/CPU-wait path below for both GPU topologies.
+        // Capture and output effects retain synchronized presentation.
+        let prefer_async_formats = tearing::eligible(
+            tearing_requested,
+            self.mirroring.is_some(),
+            !self.screen_filter.is_noop(),
+            vrr,
+            false,
+        );
+        let presentation_mode = if prefer_async_formats && frames.is_empty() {
+            PresentationMode::Async
+        } else {
+            PresentationMode::VSync
+        };
+
+        compositor.with_compositor(|c| c.prefer_async_formats(prefer_async_formats, &mut renderer));
 
         // actual rendering
         let source_output = self
@@ -1287,25 +1320,27 @@ impl SurfaceThreadState {
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
-            compositor.render_frame(
+            compositor.render_frame_with_mode(
                 &mut renderer,
                 &elements,
                 [0.0, 0.0, 0.0, 0.0],
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
+                presentation_mode,
             )
         } else {
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
-            compositor.render_frame(
+            compositor.render_frame_with_mode(
                 &mut renderer,
                 &elements,
                 CLEAR_COLOR, // TODO use a theme neutral color
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
+                presentation_mode,
             )
         };
         self.timings.draw_done(&self.clock);
@@ -1326,7 +1361,12 @@ impl SurfaceThreadState {
                     None
                 };
 
-                if frame_result.needs_sync()
+                let direct_scanout = matches!(
+                    &frame_result.primary_element,
+                    PrimaryPlaneElement::Element(_)
+                );
+                let needs_sync = frame_result.needs_sync();
+                if needs_sync
                     && let PrimaryPlaneElement::Swapchain(elem) = &frame_result.primary_element
                 {
                     elem.sync.wait()?;
@@ -1338,6 +1378,20 @@ impl SurfaceThreadState {
 
                         // Update `state` after `queue_frame`, before any early return from errors
                         if x.is_ok() {
+                            let pending_mode = compositor.with_pending_frame(|frame| {
+                                frame.map(|frame| frame.presentation_mode)
+                            });
+                            tracing::trace!(
+                                target: "cosmic_comp::presentation",
+                                output = %self.output.name(),
+                                ?render_node,
+                                target_node = ?self.target_node,
+                                requested_mode = ?presentation_mode,
+                                ?pending_mode,
+                                needs_cpu_wait = needs_sync,
+                                direct_scanout,
+                                "Frame submitted"
+                            );
                             let new_state = QueueState::WaitingForVBlank {
                                 redraw_needed: false,
                             };

@@ -700,6 +700,7 @@ impl State {
         let xdg_decoration_state = XdgDecorationState::new::<Self>(dh);
         let session_lock_manager_state =
             SessionLockManagerState::new::<Self, _>(dh, client_not_sandboxed);
+        smithay::wayland::tearing_control::TearingControlState::new::<Self>(dh);
         XWaylandKeyboardGrabState::new::<Self>(dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
         PointerConstraintsState::new::<Self>(dh);

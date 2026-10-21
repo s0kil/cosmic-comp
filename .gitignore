@@ -14,3 +14,15 @@ vendor.tar
 .vscode
 *.log
 /result
+
+# Local research, benchmark evidence, and tool state
+/.codegraph/
+/.serena/
+/docs/ARCHITECTURE.md
+/docs/DEVELOPMENT_AND_VALIDATION.md
+/docs/GITHUB_REVIEW.md
+/docs/LOCAL_TEARING_CONTEXT.md
+/docs/PROJECT_ANALYSIS.md
+/docs/S0KIL_CONTRIBUTIONS.md
+/docs/research/
+/docs/tearing/
