@@ -1639,10 +1639,6 @@ impl Workspace {
         WorkspaceRenderElement<R>: RenderElement<R>,
     {
         let output_scale = self.output.current_scale().fractional_scale();
-        let zone = {
-            let layer_map = layer_map_for_output(&self.output);
-            layer_map.non_exclusive_zone().as_local()
-        };
         let focused = self.focus_stack.get(last_active_seat).last().cloned();
         let fullscreen_focused = matches!(focused, Some(FocusTarget::Fullscreen(_)));
 
@@ -1692,15 +1688,17 @@ impl Workspace {
                     .as_logical()
                     .to_physical_precise_round(output_scale);
 
-                let fullscreen_geo = fullscreen.surface.0.geometry();
-                let scale = Scale {
-                    x: target_geo.size.w as f64 / fullscreen_geo.size.w as f64,
-                    y: target_geo.size.h as f64 / fullscreen_geo.size.h as f64,
-                };
+                let animation_scale = fullscreen.is_animating().then(|| {
+                    let fullscreen_geo = fullscreen.surface.0.geometry();
+                    Scale {
+                        x: target_geo.size.w as f64 / fullscreen_geo.size.w as f64,
+                        y: target_geo.size.h as f64 / fullscreen_geo.size.h as f64,
+                    }
+                });
 
                 // Only rescale geometry when animating
                 let animation_rescale = |elem| {
-                    if fullscreen.is_animating() {
+                    if let Some(scale) = animation_scale {
                         RescaleRenderElement::from_element(elem, render_loc, scale).into()
                     } else {
                         Into::<WorkspaceRenderElement<_>>::into(elem)
@@ -1805,6 +1803,12 @@ impl Workspace {
                 OverviewMode::None => None,
             };
 
+            // Fullscreen-only frames do not need the layer-map lock or its
+            // reserved-zone calculation. Keep this live lookup for the desktop.
+            let zone = {
+                let layer_map = layer_map_for_output(&self.output);
+                layer_map.non_exclusive_zone().as_local()
+            };
             //tiling surfaces
             self.tiling_layer.render(
                 renderer,
@@ -1868,10 +1872,6 @@ impl Workspace {
         WorkspaceRenderElement<R>: RenderElement<R>,
     {
         let output_scale = self.output.current_scale().fractional_scale();
-        let zone = {
-            let layer_map = layer_map_for_output(&self.output);
-            layer_map.non_exclusive_zone().as_local()
-        };
 
         // Render popups for the top (most recently focused) fullscreen
         let focus_stack = self.focus_stack.get(last_active_seat);
@@ -1965,6 +1965,10 @@ impl Workspace {
             self.floating_layer
                 .render_popups(renderer, alpha, scanout_node, &mut |elem| push(elem.into()));
 
+            let zone = {
+                let layer_map = layer_map_for_output(&self.output);
+                layer_map.non_exclusive_zone().as_local()
+            };
             //tiling surfaces
             self.tiling_layer.render_popups(
                 renderer,
