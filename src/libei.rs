@@ -141,8 +141,11 @@ pub fn setup_ei(
                             other => {
                                 let backend_id =
                                     InputBackendId::Ei(connection.eis_connection().clone());
-                                data.process_input_event(other, backend_id);
-                                if matches!(data.backend, BackendData::Kms(_)) {
+                                let result =
+                                    data.process_input_event_with_redraw(other, backend_id);
+                                if result.needs_redraw()
+                                    && matches!(data.backend, BackendData::Kms(_))
+                                {
                                     for output in data.common.shell.read().outputs() {
                                         data.backend.kms().schedule_render(output);
                                     }

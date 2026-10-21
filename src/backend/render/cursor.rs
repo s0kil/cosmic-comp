@@ -548,6 +548,28 @@ fn same_direction(a: f64, b: f64) -> bool {
 }
 
 impl CursorStateInner {
+    fn idle_timer_throttled(&self, now: Instant) -> bool {
+        self.idle_timer.is_some()
+            && self
+                .last_armed
+                .is_some_and(|armed| now.duration_since(armed) < ACTIVITY_THROTTLE)
+    }
+
+    fn pointer_activity(&mut self, kind: PointerEventKind, now: Instant) -> (bool, bool) {
+        // Keep every activity timestamp, including when the timer is disabled:
+        // settings may change before the next pointer event.
+        self.last_pointer_activity = now;
+        let revealed = match self.hidden {
+            Some(reason) if reason.revealed_by(kind) => {
+                self.hidden = None;
+                true
+            }
+            Some(_) => return (false, false),
+            None => false,
+        };
+        (revealed, !self.idle_timer_throttled(now))
+    }
+
     pub fn set_shape(&mut self, shape: CursorIcon) {
         self.current_cursor = Some(shape);
     }
@@ -871,22 +893,14 @@ const ACTIVITY_THROTTLE: Duration = Duration::from_millis(100);
 /// Returns true if the cursor was previously hidden and is now visible.
 pub fn notify_cursor_activity(state: &State, seat: &Seat<State>, kind: PointerEventKind) -> bool {
     let cursor_state = seat.user_data().get::<CursorState>().unwrap();
+    let now = Instant::now();
+    let (revealed, refresh) = cursor_state.lock().unwrap().pointer_activity(kind, now);
 
-    let revealed = {
-        let mut inner = cursor_state.lock().unwrap();
-        inner.last_pointer_activity = Instant::now();
-        match inner.hidden {
-            Some(reason) if reason.revealed_by(kind) => {
-                inner.hidden = None;
-                true
-            }
-            // Still hidden on purpose: leave the timer alone.
-            Some(_) => return false,
-            None => false,
-        }
-    };
-
-    refresh_idle_timer(state, seat);
+    // High-frequency motion usually leaves an existing timer armed. Avoid a
+    // second lock and clock read for that case without dropping activity.
+    if refresh {
+        refresh_idle_timer_at(state, seat, now);
+    }
     revealed
 }
 
@@ -901,10 +915,13 @@ pub fn notify_cursor_activity(state: &State, seat: &Seat<State>, kind: PointerEv
 /// context is not yet knowable here. `on_idle_timer` evaluates it on fire and
 /// re-arms for the remainder if nothing applied yet.
 pub fn refresh_idle_timer(state: &State, seat: &Seat<State>) {
+    refresh_idle_timer_at(state, seat, Instant::now());
+}
+
+fn refresh_idle_timer_at(state: &State, seat: &Seat<State>, now: Instant) {
     let config = state.common.config.cosmic_conf.cursor_hide;
     let loop_handle = &state.common.event_loop_handle;
     let cursor_state = seat.user_data().get::<CursorState>().unwrap();
-    let now = Instant::now();
 
     let (old_token, since_activity) = {
         let mut inner = cursor_state.lock().unwrap();
@@ -912,11 +929,7 @@ pub fn refresh_idle_timer(state: &State, seat: &Seat<State>) {
             return;
         }
         // Coalesce bursts from high-frequency pointers.
-        let throttled = inner.idle_timer.is_some()
-            && inner
-                .last_armed
-                .is_some_and(|t| now.duration_since(t) < ACTIVITY_THROTTLE);
-        if throttled {
+        if inner.idle_timer_throttled(now) {
             return;
         }
         let since_activity = now.duration_since(inner.last_pointer_activity);
@@ -1021,7 +1034,76 @@ fn hide_cursor(state: &mut State, seat: &Seat<State>, reason: HideReason) {
 
 #[cfg(test)]
 mod test {
-    use super::{HideReason, PointerEventKind};
+    use super::{ACTIVITY_THROTTLE, CursorStateInner, HideReason, PointerEventKind};
+    use calloop::{
+        EventLoop,
+        timer::{TimeoutAction, Timer},
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn motion_bursts_keep_activity_without_rearming_the_timer() {
+        let event_loop = EventLoop::<()>::try_new().unwrap();
+        let token = event_loop
+            .handle()
+            .insert_source(Timer::from_duration(Duration::from_secs(60)), |_, _, _| {
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        let mut state = CursorStateInner::default();
+        let armed = Instant::now();
+        state.idle_timer = Some(token);
+        state.last_armed = Some(armed);
+
+        for milliseconds in 0..100 {
+            let now = armed + Duration::from_millis(milliseconds);
+            assert_eq!(
+                state.pointer_activity(PointerEventKind::Motion, now),
+                (false, false)
+            );
+            assert_eq!(state.last_pointer_activity, now);
+            assert_eq!(state.last_armed, Some(armed));
+        }
+        assert_eq!(
+            state.pointer_activity(PointerEventKind::Motion, armed + ACTIVITY_THROTTLE),
+            (false, true)
+        );
+
+        // A removed or unsuccessfully armed timer must be retried immediately,
+        // even if the previous successful arm was less than 100ms ago.
+        state.idle_timer = None;
+        assert_eq!(
+            state.pointer_activity(PointerEventKind::Motion, armed),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn activity_preserves_hidden_cursor_reveal_policy() {
+        let mut state = CursorStateInner::default();
+        let now = Instant::now();
+        state.hidden = Some(HideReason::Touch);
+        assert_eq!(
+            state.pointer_activity(PointerEventKind::Other, now),
+            (false, false)
+        );
+        assert_eq!(state.hidden, Some(HideReason::Touch));
+        assert_eq!(state.last_pointer_activity, now);
+        assert_eq!(
+            state.pointer_activity(PointerEventKind::Motion, now),
+            (true, true)
+        );
+        assert_eq!(state.hidden, None);
+
+        for reason in [HideReason::Idle, HideReason::Typing] {
+            state.hidden = Some(reason);
+            assert_eq!(
+                state.pointer_activity(PointerEventKind::Other, now),
+                (true, true)
+            );
+            assert_eq!(state.hidden, None);
+        }
+    }
 
     #[test]
     fn touch_hidden_cursor_waits_for_movement() {

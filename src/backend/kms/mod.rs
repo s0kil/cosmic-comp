@@ -215,10 +215,12 @@ fn init_libinput(
             state.backend.kms().input_devices.remove(&*device.name());
         }
 
-        state.process_input_event(event, crate::input::InputBackendId::Normal);
-
-        for output in state.common.shell.read().outputs() {
-            state.backend.kms().schedule_render(output);
+        let result =
+            state.process_input_event_with_redraw(event, crate::input::InputBackendId::Normal);
+        if result.needs_redraw() {
+            for output in state.common.shell.read().outputs() {
+                state.backend.kms().schedule_render(output);
+            }
         }
     })
     .map_err(|err| err.error)

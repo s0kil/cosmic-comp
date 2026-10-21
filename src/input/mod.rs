@@ -95,6 +95,8 @@ use std::{
 
 pub mod actions;
 pub(crate) mod event_flush;
+mod event_result;
+pub(crate) use event_result::InputEventResult;
 pub mod gestures;
 pub mod tablet_emu;
 
@@ -216,11 +218,35 @@ impl ModifiersShortcutQueue {
 }
 
 impl State {
-    #[profiling::function]
     pub fn process_input_event<B: InputBackend>(
         &mut self,
         event: InputEvent<B>,
         backend_id: InputBackendId,
+    ) where
+        <B as InputBackend>::Device: 'static,
+    {
+        self.process_input_event_with_redraw(event, backend_id);
+    }
+
+    pub(crate) fn process_input_event_with_redraw<B: InputBackend>(
+        &mut self,
+        event: InputEvent<B>,
+        backend_id: InputBackendId,
+    ) -> InputEventResult
+    where
+        <B as InputBackend>::Device: 'static,
+    {
+        let mut result = InputEventResult::default();
+        self.process_input_event_inner(event, backend_id, &mut result);
+        result
+    }
+
+    #[profiling::function]
+    fn process_input_event_inner<B: InputBackend>(
+        &mut self,
+        event: InputEvent<B>,
+        backend_id: InputBackendId,
+        result: &mut InputEventResult,
     ) where
         <B as InputBackend>::Device: 'static,
     {
@@ -396,9 +422,11 @@ impl State {
                     .cloned()
                 {
                     self.common.idle_notifier_state.notify_activity(&seat);
-                    notify_cursor_activity(self, &seat, PointerEventKind::Motion);
+                    let cursor_revealed =
+                        notify_cursor_activity(self, &seat, PointerEventKind::Motion);
                     let current_output = seat.active_output();
 
+                    let mut magnifying = false;
                     if self.common.config.cosmic_conf.cursor_shake_to_find
                         && seat
                             .get_pointer()
@@ -413,6 +441,7 @@ impl State {
                             cursor.is_magnifying()
                         };
                         if active {
+                            magnifying = true;
                             self.backend.schedule_render(&current_output);
                         }
                     }
@@ -456,6 +485,7 @@ impl State {
                     }
 
                     std::mem::drop(shell);
+                    let was_grabbed = ptr.is_grabbed();
                     ptr.relative_motion(
                         self,
                         under.clone(),
@@ -468,6 +498,11 @@ impl State {
 
                     if pointer_locked {
                         ptr.frame(self);
+                        result.locked_pointer(
+                            cursor_revealed,
+                            magnifying,
+                            was_grabbed || ptr.is_grabbed(),
+                        );
                         return;
                     }
 
