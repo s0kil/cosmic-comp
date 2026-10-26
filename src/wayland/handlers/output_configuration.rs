@@ -190,6 +190,13 @@ impl State {
             }
             return false;
         }
+        if test_only {
+            // The backend tested the temporary values; they are not applied state.
+            for (output, backup) in backups {
+                *output.config_mut() = backup;
+            }
+            return true;
+        }
         self.common.refresh();
 
         for output in conf

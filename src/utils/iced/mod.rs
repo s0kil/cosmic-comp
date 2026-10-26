@@ -441,11 +441,65 @@ impl<P: Program + Send + 'static> IcedElement<P> {
 
 impl<P: Program + Send + 'static + Clone> IcedElement<P> {
     pub fn deep_clone(&self) -> Self {
-        let internal = self.0.lock().unwrap();
+        let mut internal = self.0.lock().unwrap();
         if !internal.state.is_queue_empty() {
-            self.force_update();
+            internal.update(true);
         }
         IcedElement(Arc::new(Mutex::new(internal.clone())))
+    }
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Counter(u32);
+
+    impl Program for Counter {
+        type Message = u32;
+
+        fn update(
+            &mut self,
+            amount: u32,
+            _handle: &LoopHandle<'static, crate::state::State>,
+            _seat: Option<&(Seat<crate::state::State>, Serial)>,
+        ) -> Task<u32> {
+            self.0 += amount;
+            Task::none()
+        }
+
+        fn view(&self) -> cosmic::Element<'_, u32> {
+            cosmic::widget::space::horizontal().width(1).into()
+        }
+    }
+
+    #[test]
+    fn deep_clone_applies_pending_messages_without_relocking() {
+        let (done, completed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let event_loop = calloop::EventLoop::<crate::state::State>::try_new().unwrap();
+            let original = IcedElement::new(
+                Counter::default(),
+                (10, 10),
+                event_loop.handle(),
+                Theme::default(),
+            );
+            original.queue_message(7);
+
+            let cloned = original.deep_clone();
+            assert_eq!(original.with_program(|p| p.0), 7);
+            assert_eq!(cloned.with_program(|p| p.0), 7);
+
+            cloned.queue_message(2);
+            cloned.force_update();
+            assert_eq!(cloned.with_program(|p| p.0), 9);
+            assert_eq!(original.with_program(|p| p.0), 7);
+            done.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deep_clone must complete without recursive locking");
     }
 }
 

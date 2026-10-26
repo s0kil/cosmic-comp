@@ -14,6 +14,8 @@ pub struct Timings {
     min_refresh_interval_ns: Option<NonZeroU64>,
     vrr: bool,
     vendor: Option<u32>,
+    // Display phase can be older than an async flip completion (e.g. i915).
+    last_display_phase: Option<Time<Monotonic>>,
 
     pub pending_frame: Option<PendingFrame>,
     pub previous_frames: VecDeque<Frame>,
@@ -87,6 +89,7 @@ impl Timings {
             min_refresh_interval_ns,
             vrr,
             vendor,
+            last_display_phase: None,
 
             pending_frame: None,
             previous_frames: VecDeque::new(),
@@ -106,6 +109,7 @@ impl Timings {
             .and_then(NonZeroU64::new);
 
         self.previous_frames.clear();
+        self.last_display_phase = None;
     }
 
     pub fn set_min_refresh_interval(&mut self, min_interval: Option<Duration>) {
@@ -152,7 +156,8 @@ impl Timings {
         }
     }
 
-    pub fn presented(&mut self, value: Time<Monotonic>) {
+    pub fn presented(&mut self, value: Time<Monotonic>, display_phase: Time<Monotonic>) {
+        self.last_display_phase = Some(display_phase);
         if let Some(frame) = self.pending_frame.take() {
             let new_frame = Frame {
                 render_start: frame.render_start,
@@ -279,19 +284,12 @@ impl Timings {
         1.0 / (secs / self.previous_frames.len() as f64)
     }
 
-    pub fn next_presentation_time(&self, clock: &Clock<Monotonic>) -> Duration {
-        let mut now = clock.now().into();
+    pub fn presentation_deadline(&self, now: Time<Monotonic>) -> Option<Time<Monotonic>> {
+        let sampled_now: Duration = now.into();
+        let mut now = sampled_now;
 
-        let Some(refresh_interval_ns) = self.refresh_interval_ns else {
-            return Duration::ZERO;
-        };
-        let Some(last_presentation_time): Option<Duration> = self
-            .previous_frames
-            .back()
-            .map(|frame| frame.presentation_presented.into())
-        else {
-            return Duration::ZERO;
-        };
+        let refresh_interval_ns = self.refresh_interval_ns?;
+        let last_presentation_time: Duration = self.last_display_phase?.into();
         let refresh_interval_ns = refresh_interval_ns.get();
 
         if now <= last_presentation_time {
@@ -319,9 +317,12 @@ impl Timings {
         // If VRR is enabled and more than one frame passed since last presentation, assume that we
         // can present immediately.
         if self.vrr && to_next_ns > refresh_interval_ns {
-            Duration::ZERO
+            None
         } else {
-            last_presentation_time + Duration::from_nanos(to_next_ns) - now
+            Some(
+                (sampled_now + (last_presentation_time + Duration::from_nanos(to_next_ns) - now))
+                    .into(),
+            )
         }
     }
 
@@ -330,10 +331,8 @@ impl Timings {
         let Some(min_refresh_interval_ns) = self.min_refresh_interval_ns else {
             return true;
         };
-        let Some(last_presentation_time): Option<Duration> = self
-            .previous_frames
-            .back()
-            .map(|frame| frame.presentation_presented.into())
+        let Some(last_presentation_time): Option<Duration> =
+            self.last_display_phase.map(Into::into)
         else {
             return true;
         };
@@ -363,7 +362,11 @@ impl Timings {
         now >= deadline
     }
 
-    pub fn next_render_time(&self, clock: &Clock<Monotonic>) -> Duration {
+    pub fn next_render_time(
+        &self,
+        now: Time<Monotonic>,
+        deadline: Option<Time<Monotonic>>,
+    ) -> Duration {
         let Some(refresh_interval) = self.refresh_interval_ns else {
             return Duration::ZERO; // we don't know what to expect, so render immediately.
         };
@@ -371,7 +374,9 @@ impl Timings {
         const MIN_MARGIN: Duration = Duration::from_millis(3);
         let baseline = MIN_MARGIN.max(Duration::from_nanos(refresh_interval.get() / 2));
 
-        let estimated_presentation_time = self.next_presentation_time(clock);
+        let estimated_presentation_time = deadline
+            .map(|deadline| Time::elapsed(&now, deadline))
+            .unwrap_or_default();
         if estimated_presentation_time.is_zero() {
             return Duration::ZERO;
         }
@@ -387,5 +392,112 @@ impl Timings {
 
         let margin = avg_submittime + BASE_SAFETY_MARGIN;
         estimated_presentation_time.saturating_sub(margin)
+    }
+
+    pub fn empty_frame_delay(
+        &self,
+        now: Time<Monotonic>,
+        deadline: Option<Time<Monotonic>>,
+    ) -> Duration {
+        let remaining = deadline
+            .map(|deadline| Time::elapsed(&now, deadline))
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            self.refresh_interval()
+        } else {
+            remaining
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timings() -> Timings {
+        Timings {
+            refresh_interval_ns: NonZeroU64::new(16_666_667),
+            min_refresh_interval_ns: None,
+            vrr: false,
+            vendor: None,
+            last_display_phase: Some(Duration::from_millis(999_990).into()),
+            pending_frame: None,
+            previous_frames: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn empty_frame_keeps_the_absolute_deadline_across_render_work() {
+        let timings = timings();
+        let now = Duration::from_secs(1000).into();
+        let deadline = timings.presentation_deadline(now);
+        assert_eq!(
+            deadline.map(Duration::from),
+            Some(Duration::from_nanos(1_000_006_666_667))
+        );
+        assert_eq!(
+            timings.empty_frame_delay(Duration::from_millis(1_000_002).into(), deadline),
+            Duration::from_nanos(4_666_667)
+        );
+        assert_eq!(
+            timings.empty_frame_delay(Duration::from_millis(1_000_007).into(), deadline),
+            timings.refresh_interval()
+        );
+    }
+
+    #[test]
+    fn unknown_and_vrr_predictions_remain_immediate_with_empty_frame_fallback() {
+        let now = Duration::from_secs(1000).into();
+        let mut timings = timings();
+        timings.last_display_phase = None;
+        assert!(timings.presentation_deadline(now).is_none());
+        assert_eq!(timings.next_render_time(now, None), Duration::ZERO);
+        assert_eq!(
+            timings.empty_frame_delay(now, None),
+            timings.refresh_interval()
+        );
+        timings.last_display_phase = Some(Duration::from_millis(999_970).into());
+        timings.vrr = true;
+        assert!(timings.presentation_deadline(now).is_none());
+        timings.set_refresh_interval(None);
+        assert_eq!(timings.empty_frame_delay(now, None), Duration::ZERO);
+    }
+
+    #[test]
+    fn early_event_and_nvidia_keep_existing_scheduling_policy() {
+        let mut timings = timings();
+        let now = Duration::from_secs(1000).into();
+        timings.last_display_phase = Some(Duration::from_millis(1_000_001).into());
+        let deadline = timings.presentation_deadline(now);
+        assert_eq!(
+            deadline.map(Duration::from),
+            Some(Duration::from_millis(1_000_001))
+        );
+        timings.vendor = Some(0x10de);
+        assert_eq!(timings.next_render_time(now, deadline), Duration::ZERO);
+    }
+
+    #[test]
+    fn async_completion_history_is_distinct_from_repeated_display_phase() {
+        let mut timings = timings();
+        let phase = Duration::from_secs(1000).into();
+        for millis in [1_000_001, 1_000_003] {
+            let start: Time<Monotonic> = Duration::from_millis(millis).into();
+            timings.pending_frame = Some(PendingFrame {
+                render_start: start,
+                render_duration_elements: None,
+                render_duration_draw: None,
+                presentation_submitted: Some(start),
+            });
+            timings.presented(Duration::from_millis(millis + 1).into(), phase);
+        }
+        assert_eq!(timings.previous_frames.len(), 2);
+        assert!(
+            timings
+                .previous_frames
+                .iter()
+                .all(|f| f.frame_time() == Duration::from_millis(1))
+        );
+        assert_eq!(timings.last_display_phase, Some(phase));
     }
 }

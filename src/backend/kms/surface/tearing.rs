@@ -8,6 +8,7 @@ use smithay::{
         presentation_time::server::wp_presentation_feedback,
         tearing_control::v1::server::wp_tearing_control_v1::PresentationHint,
     },
+    utils::{Monotonic, Time},
     wayland::{
         compositor::with_states, seat::WaylandFocus,
         tearing_control::TearingControlSurfaceCachedState,
@@ -70,13 +71,46 @@ pub(super) fn presentation_flags(
     hardware_clock: bool,
 ) -> wp_presentation_feedback::Kind {
     let mut flags = wp_presentation_feedback::Kind::HwCompletion;
-    if hardware_clock {
+    if hardware_clock && mode == PresentationMode::VSync {
         flags |= wp_presentation_feedback::Kind::HwClock;
     }
     if mode == PresentationMode::VSync {
         flags |= wp_presentation_feedback::Kind::Vsync;
     }
     flags
+}
+
+pub(super) struct CompletionTiming {
+    pub presented: Time<Monotonic>,
+    pub display_phase: Time<Monotonic>,
+    pub hardware_clock: bool,
+}
+
+/// Async DRM events can carry the previous vblank's timestamp, not the flip's.
+/// Keep that phase for display scheduling, but report software-observed completion.
+pub(super) fn completion_timing(
+    mode: PresentationMode,
+    hardware_time: Option<Time<Monotonic>>,
+    observed: Time<Monotonic>,
+) -> CompletionTiming {
+    let hardware_clock = mode == PresentationMode::VSync && hardware_time.is_some();
+    CompletionTiming {
+        presented: if hardware_clock {
+            hardware_time.unwrap()
+        } else {
+            observed
+        },
+        display_phase: hardware_time.unwrap_or(observed),
+        hardware_clock,
+    }
+}
+
+pub(super) fn fullscreen_drives_vrr(
+    vrr: bool,
+    estimate: impl FnOnce() -> Option<std::time::Duration>,
+) -> bool {
+    vrr && estimate()
+        .is_some_and(|time| time <= std::time::Duration::from_nanos(1_000_000_000 / 30))
 }
 
 #[cfg(test)]
@@ -90,12 +124,51 @@ mod tests {
             let asynchronous = presentation_flags(PresentationMode::Async, hardware_clock);
             assert!(sync.contains(wp_presentation_feedback::Kind::Vsync));
             assert!(!asynchronous.contains(wp_presentation_feedback::Kind::Vsync));
+            assert!(!asynchronous.contains(wp_presentation_feedback::Kind::HwClock));
+            assert!(asynchronous.contains(wp_presentation_feedback::Kind::HwCompletion));
             assert_eq!(
-                asynchronous.contains(wp_presentation_feedback::Kind::HwClock),
+                sync.contains(wp_presentation_feedback::Kind::HwClock),
                 hardware_clock
             );
-            assert!(asynchronous.contains(wp_presentation_feedback::Kind::HwCompletion));
         }
+    }
+
+    #[test]
+    fn async_events_keep_phase_without_backdating_completion() {
+        use std::time::Duration;
+        let phase = Duration::from_secs(1000).into();
+        for millis in [1_000_001, 1_000_003] {
+            let observed = Duration::from_millis(millis).into();
+            let timing = completion_timing(PresentationMode::Async, Some(phase), observed);
+            assert_eq!(timing.presented, observed);
+            assert_eq!(timing.display_phase, phase);
+            assert!(!timing.hardware_clock);
+        }
+        let sync = completion_timing(
+            PresentationMode::VSync,
+            Some(phase),
+            Duration::from_secs(1001).into(),
+        );
+        assert_eq!(sync.presented, phase);
+        assert!(sync.hardware_clock);
+        let observed = Duration::from_secs(1001).into();
+        let fallback = completion_timing(PresentationMode::VSync, None, observed);
+        assert_eq!(fallback.presented, observed);
+        assert_eq!(fallback.display_phase, observed);
+        assert!(!fallback.hardware_clock);
+    }
+
+    #[test]
+    fn disabled_vrr_never_walks_the_surface_tree() {
+        use std::time::Duration;
+        assert!(!fullscreen_drives_vrr(false, || panic!("unused estimate")));
+        assert!(fullscreen_drives_vrr(true, || Some(Duration::from_millis(
+            10
+        ))));
+        assert!(!fullscreen_drives_vrr(true, || Some(
+            Duration::from_millis(40)
+        )));
+        assert!(!fullscreen_drives_vrr(true, || None));
     }
 
     #[test]

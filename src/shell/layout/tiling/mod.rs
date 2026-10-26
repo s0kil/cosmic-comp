@@ -4057,21 +4057,7 @@ impl TilingLayout {
             .is_some()
             .then(|| &self.queue.trees.front().unwrap().0);
 
-        let percentage = if let Some(animation_start) = self.queue.animation_start {
-            if *duration == Duration::ZERO {
-                1.0
-            } else {
-                let now = Instant::now();
-                let total = duration.as_millis() as f32;
-                let since = now.duration_since(animation_start).as_millis() as f32;
-                let percentage = since / total;
-                debug_assert!(!percentage.is_nan());
-                debug_assert!(!percentage.is_infinite());
-                ease(EaseInOutCubic, 0.0, 1.0, percentage)
-            }
-        } else {
-            1.0
-        };
+        let percentage = animation_progress(self.queue.animation_start, *duration, Instant::now());
         let draw_groups = overview.0.alpha();
 
         let is_overview = !matches!(overview.0, OverviewMode::None);
@@ -4223,13 +4209,7 @@ impl TilingLayout {
             .is_some()
             .then(|| &self.queue.trees.front().unwrap().0);
 
-        let percentage = if let Some(animation_start) = self.queue.animation_start {
-            let percentage = Instant::now().duration_since(animation_start).as_millis() as f32
-                / duration.as_millis() as f32;
-            ease(EaseInOutCubic, 0.0, 1.0, percentage)
-        } else {
-            1.0
-        };
+        let percentage = animation_progress(self.queue.animation_start, *duration, Instant::now());
         let draw_groups = overview.0.alpha();
 
         let is_mouse_tiling = (matches!(
@@ -5954,5 +5934,46 @@ fn scale_to_center<C>(
             )
                 .into(),
         )
+    }
+}
+
+/// Shared by popup and window rendering, including instantaneous layout changes.
+fn animation_progress(start: Option<Instant>, duration: Duration, now: Instant) -> f32 {
+    match start {
+        Some(start) if duration.as_millis() > 0 => ease(
+            EaseInOutCubic,
+            0.0,
+            1.0,
+            now.saturating_duration_since(start).as_millis() as f32 / duration.as_millis() as f32,
+        ),
+        _ => 1.0,
+    }
+}
+
+#[cfg(test)]
+mod animation_progress_tests {
+    use super::*;
+
+    #[test]
+    fn instant_and_submillisecond_transitions_are_finite() {
+        let now = Instant::now();
+        assert_eq!(animation_progress(Some(now), Duration::ZERO, now), 1.0);
+        assert_eq!(animation_progress(None, Duration::from_secs(1), now), 1.0);
+        assert_eq!(
+            animation_progress(
+                Some(now),
+                Duration::from_millis(200),
+                now + Duration::from_millis(100)
+            ),
+            0.5
+        );
+        assert_eq!(
+            animation_progress(
+                Some(now),
+                Duration::from_micros(100),
+                now + Duration::from_micros(50)
+            ),
+            1.0
+        );
     }
 }

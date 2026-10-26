@@ -198,9 +198,9 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
             return;
         }
 
-        // Deliver the whole input batch before housekeeping can wait on the
-        // shell or refresh windows. Keep the final flush below for events those
-        // routines generate, and avoid an extra flush on input-free iterations.
+        // Deliver input and frame-callback batches before housekeeping can wait
+        // on the shell or refresh windows. Keep the final flush for events those
+        // routines generate, and skip this flush when no early request was made.
         state
             .input_event_flush
             .flush(&mut state.common.display_handle);

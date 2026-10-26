@@ -71,7 +71,7 @@ use smithay::{
         wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
         wayland_server::protocol::wl_surface::WlSurface,
     },
-    utils::{Clock, Monotonic, Physical, Point, Rectangle, Transform},
+    utils::{Clock, Monotonic, Physical, Point, Rectangle, Time, Transform},
     wayland::{
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
         image_copy_capture::{
@@ -98,6 +98,7 @@ use std::{
 };
 
 mod commands;
+mod retry;
 mod tearing;
 mod timings;
 pub use self::timings::Timings;
@@ -139,6 +140,7 @@ pub struct SurfaceThreadState {
 
     state: QueueState,
     timings: Timings,
+    render_retry: retry::RenderRetry,
     frame_callback_seq: usize,
     last_presentation_mode: PresentationMode,
     thread_sender: Sender<SurfaceCommand>,
@@ -174,7 +176,7 @@ pub type GbmDrmOutput = DrmOutput<
     Option<(
         OutputPresentationFeedback,
         Receiver<PendingImageCopyData>,
-        Duration,
+        Option<Time<Monotonic>>,
     )>,
     DrmDeviceFd,
 >;
@@ -214,7 +216,10 @@ pub enum ThreadCommand {
     },
     UpdateMirroring(Option<Output>),
     UpdateScreenFilter(ScreenFilter),
-    VBlank(Option<DrmEventMetadata>),
+    VBlank {
+        metadata: Option<DrmEventMetadata>,
+        observed: Time<Monotonic>,
+    },
     ScheduleRender,
     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
     UseAdaptiveSync(AdaptiveSync),
@@ -287,6 +292,7 @@ impl Surface {
                         return;
                     }
                     state.common.send_frames(&output_clone, Some(sequence));
+                    state.input_event_flush.request();
                 }
                 Event::Msg(SurfaceCommand::RenderStates(states)) => {
                     if output_clone.mirroring().is_some() {
@@ -386,7 +392,10 @@ impl Surface {
     }
 
     pub fn on_vblank(&self, metadata: Option<DrmEventMetadata>) {
-        let _ = self.thread_command.send(ThreadCommand::VBlank(metadata));
+        let _ = self.thread_command.send(ThreadCommand::VBlank {
+            metadata,
+            observed: Clock::<Monotonic>::new().now(),
+        });
     }
 
     pub fn schedule_render(&self) {
@@ -543,6 +552,7 @@ fn surface_thread(
 
         state: QueueState::Idle,
         timings: Timings::new(None, None, false, target_node),
+        render_retry: retry::RenderRetry::default(),
         frame_callback_seq: 0,
         last_presentation_mode: PresentationMode::VSync,
         thread_sender,
@@ -589,8 +599,8 @@ fn surface_thread(
                 state.node_removed(node);
                 let _ = sync.send(());
             }
-            Event::Msg(ThreadCommand::VBlank(metadata)) => {
-                state.on_vblank(metadata);
+            Event::Msg(ThreadCommand::VBlank { metadata, observed }) => {
+                state.on_vblank(metadata, observed);
             }
             Event::Msg(ThreadCommand::ScheduleRender) => {
                 // Clear before processing: input or client commits arriving
@@ -700,6 +710,7 @@ impl SurfaceThreadState {
 
     fn resume(&mut self, compositor: GbmDrmOutput) {
         self.last_presentation_mode = PresentationMode::VSync;
+        self.render_retry.reset();
         let (mode, min_hz) = compositor.with_compositor(|c| {
             (
                 c.surface().pending_mode(),
@@ -755,7 +766,7 @@ impl SurfaceThreadState {
     }
 
     #[profiling::function]
-    fn on_vblank(&mut self, metadata: Option<DrmEventMetadata>) {
+    fn on_vblank(&mut self, metadata: Option<DrmEventMetadata>, observed: Time<Monotonic>) {
         let Some(compositor) = self.compositor.as_mut() else {
             return;
         };
@@ -793,56 +804,56 @@ impl SurfaceThreadState {
         // finish tracy frame
         let _ = self.vblank_frame.take();
 
-        // The hint is only a request. Read the mode KMS actually accepted before
-        // frame_submitted advances the pending frame.
-        let presentation_mode = compositor.with_pending_frame(|frame| {
-            frame.map_or(PresentationMode::VSync, |frame| frame.presentation_mode)
-        });
+        // Preserve the completed frame even if submitting a queued successor fails.
+        let Some(completed) = compositor.frame_submitted_with_result() else {
+            return;
+        };
+        let next_frame_pending = compositor.with_pending_frame(|frame| frame.is_some());
+        let retry = if let Err(err) = completed.next_frame_result {
+            warn!(?err, "Failed to submit queued frame after completion");
+            true
+        } else {
+            false
+        };
+        let presentation_mode = completed.presentation_mode;
         if self.last_presentation_mode != presentation_mode {
             tracing::debug!(output = %self.output.name(), ?presentation_mode, "Presentation mode changed");
         }
         self.last_presentation_mode = presentation_mode;
+        let timing = tearing::completion_timing(
+            presentation_mode,
+            presentation_time.map(Into::into),
+            observed,
+        );
+        self.timings
+            .presented(timing.presented, timing.display_phase);
 
-        // mark last frame completed
-        if let Ok(Some(Some((mut feedback, frames, estimated_presentation_time)))) =
-            compositor.frame_submitted()
+        if let Some((mut feedback, frames, estimated_presentation_time)) = completed.user_data
             && self.mirroring.is_none()
         {
-            let name = self.output.name();
-            let message = if let Some(presentation_time) = presentation_time {
-                let misprediction_s =
-                    presentation_time.as_secs_f64() - estimated_presentation_time.as_secs_f64();
+            if let Some(estimate) = estimated_presentation_time {
+                let actual = Duration::from(timing.presented).as_secs_f64();
+                let expected = Duration::from(estimate).as_secs_f64();
                 tracy_client::Client::running().unwrap().plot(
                     self.presentation_misprediction_plot_name,
-                    misprediction_s * 1000.,
+                    (actual - expected) * 1000.,
                 );
-
-                let now = Duration::from(now);
-                if presentation_time > now {
-                    let diff = presentation_time - now;
-                    tracy_client::Client::running().unwrap().plot(
-                        self.time_since_presentation_plot_name,
-                        -diff.as_secs_f64() * 1000.,
-                    );
-                    format!("vblank on {name}, presentation is {diff:?} later")
-                } else {
-                    let diff = now - presentation_time;
-                    tracy_client::Client::running().unwrap().plot(
-                        self.time_since_presentation_plot_name,
-                        diff.as_secs_f64() * 1000.,
-                    );
-                    format!("vblank on {name}, presentation was {diff:?} ago")
-                }
-            } else {
-                format!("vblank on {name}, presentation time unknown")
-            };
+            }
+            let delay = Time::elapsed(&timing.presented, now);
+            tracy_client::Client::running().unwrap().plot(
+                self.time_since_presentation_plot_name,
+                delay.as_secs_f64() * 1000.,
+            );
+            let message = format!(
+                "completion on {}, observed {delay:?} ago, hardware_clock={}",
+                self.output.name(),
+                timing.hardware_clock,
+            );
             tracy_client::Client::running()
                 .unwrap()
                 .message(&message, 0);
 
-            let clock = presentation_time.map(Into::into).unwrap_or(now);
-            let flags = tearing::presentation_flags(presentation_mode, presentation_time.is_some());
-
+            let flags = tearing::presentation_flags(presentation_mode, timing.hardware_clock);
             let rate = self
                 .output
                 .current_mode()
@@ -860,24 +871,19 @@ impl SurfaceThreadState {
                 Some(rate) => Refresh::Fixed(rate),
                 None => Refresh::Unknown,
             };
-
             if let Some(last_sequence) = self.last_sequence {
-                let delta = sequence as f64 - last_sequence as f64;
+                let delta = sequence.wrapping_sub(last_sequence);
                 tracy_client::Client::running()
                     .unwrap()
-                    .plot(self.sequence_delta_plot_name, delta);
+                    .plot(self.sequence_delta_plot_name, f64::from(delta));
             }
             self.last_sequence = Some(sequence);
-
-            feedback.presented(clock, refresh, sequence as u64, flags);
-
-            self.timings.presented(clock);
-
+            feedback.presented(timing.presented, refresh, sequence as u64, flags);
             while let Ok(pending_image_copy_data) = frames.recv() {
                 pending_image_copy_data.send_success_when_ready(
                     self.output.current_transform(),
                     &self.loop_handle,
-                    clock,
+                    timing.presented,
                 );
             }
         }
@@ -890,7 +896,11 @@ impl SurfaceThreadState {
             QueueState::WaitingForEstimatedVBlankAndQueued { .. } => unreachable!(),
         };
 
-        if redraw_needed
+        if next_frame_pending {
+            self.state = QueueState::WaitingForVBlank { redraw_needed };
+        }
+        if retry
+            || redraw_needed
             || self
                 .shell
                 .read()
@@ -958,7 +968,8 @@ impl SurfaceThreadState {
             };
         }
 
-        let estimated_presentation = self.timings.next_presentation_time(&self.clock);
+        let now = self.clock.now();
+        let estimated_presentation = self.timings.presentation_deadline(now);
         let immediate = tearing::render_immediately(
             self.last_presentation_mode,
             tearing::requested(&self.shell.read(), &self.output)
@@ -969,8 +980,9 @@ impl SurfaceThreadState {
         let render_start = if immediate {
             Duration::ZERO
         } else {
-            self.timings.next_render_time(&self.clock)
-        };
+            self.timings.next_render_time(now, estimated_presentation)
+        }
+        .max(self.render_retry.minimum_delay());
 
         let timer = if render_start.is_zero() {
             trace!("Running late for frame.");
@@ -983,11 +995,15 @@ impl SurfaceThreadState {
         let token = self
             .loop_handle
             .insert_source(timer, move |_time, _, state| {
-                if let Err(err) = state.redraw(estimated_presentation) {
-                    let name = state.output.name();
-                    warn!(?name, "Failed to submit rendering: {:?}", err);
-                    state.last_presentation_mode = PresentationMode::VSync;
-                    state.queue_redraw(true);
+                match state.redraw(estimated_presentation) {
+                    Ok(()) => state.render_retry.reset(),
+                    Err(err) => {
+                        let name = state.output.name();
+                        warn!(?name, "Failed to submit rendering: {:?}", err);
+                        state.render_retry.failed();
+                        state.last_presentation_mode = PresentationMode::VSync;
+                        state.queue_redraw(true);
+                    }
                 }
                 TimeoutAction::Drop
             })
@@ -1022,7 +1038,7 @@ impl SurfaceThreadState {
     }
 
     #[profiling::function]
-    fn redraw(&mut self, estimated_presentation: Duration) -> Result<()> {
+    fn redraw(&mut self, estimated_presentation: Option<Time<Monotonic>>) -> Result<()> {
         let tearing_requested = tearing::requested(&self.shell.read(), &self.output);
         let Some(compositor) = self.compositor.as_mut() else {
             return Ok(());
@@ -1063,16 +1079,16 @@ impl SurfaceThreadState {
             if let Some((_, workspace)) = shell.workspaces.active(output) {
                 let seat = shell.seats.last_active();
                 if let Some(fullscreen_surface) = workspace.get_fullscreen(seat) {
-                    const _30_FPS: Duration = Duration::from_nanos(1_000_000_000 / 30);
                     (
                         true,
-                        fullscreen_surface
-                            .surface
-                            .wl_surface()
-                            .is_some_and(|surface| {
-                                recursive_frame_time_estimation(&self.clock, &surface)
-                                    .is_some_and(|dur| dur <= _30_FPS)
-                            }),
+                        tearing::fullscreen_drives_vrr(
+                            self.vrr_mode != AdaptiveSync::Disabled,
+                            || {
+                                fullscreen_surface.surface.wl_surface().and_then(|surface| {
+                                    recursive_frame_time_estimation(&self.clock, &surface)
+                                })
+                            },
+                        ),
                         animations_going,
                     )
                 } else {
@@ -1487,7 +1503,11 @@ impl SurfaceThreadState {
         Ok(())
     }
 
-    fn queue_estimated_vblank(&mut self, target_presentation_time: Duration, force: bool) {
+    fn queue_estimated_vblank(
+        &mut self,
+        target_presentation_time: Option<Time<Monotonic>>,
+        force: bool,
+    ) {
         match mem::take(&mut self.state) {
             QueueState::Idle => unreachable!(),
             QueueState::Queued(_) => (),
@@ -1503,13 +1523,10 @@ impl SurfaceThreadState {
         }
 
         let now = self.clock.now();
-        let mut duration = target_presentation_time.saturating_sub(now.into());
-
-        // No use setting a zero timer, since we'll send frame callbacks anyway right after the call to
-        // render(). This can happen for example with unknown presentation time from DRM.
-        if duration.is_zero() {
-            duration += self.timings.refresh_interval();
-        }
+        // Unknown or elapsed targets keep the existing one-refresh fallback.
+        let duration = self
+            .timings
+            .empty_frame_delay(now, target_presentation_time);
 
         trace!("queueing estimated vblank timer to fire in {duration:?}");
 

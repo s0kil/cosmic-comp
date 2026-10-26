@@ -1510,7 +1510,7 @@ impl SpaceElement for CosmicStack {
         })
     }
     fn refresh(&self) {
-        self.0.with_program(|p| {
+        let new_header_width = self.0.with_program(|p| {
             let mut windows = p.windows.lock().unwrap();
 
             // don't let the stack become empty
@@ -1529,11 +1529,8 @@ impl SpaceElement for CosmicStack {
                 });
             let active = p.active.load(Ordering::SeqCst);
 
-            if old_active != active {
-                self.0
-                    .resize(Size::from((self.active().geometry().size.w, TAB_HEIGHT)));
-                self.0.force_redraw();
-            }
+            let new_header_width =
+                (old_active != active).then(|| windows[active].geometry().size.w);
 
             windows.iter().enumerate().for_each(|(i, w)| {
                 if i == active {
@@ -1545,7 +1542,14 @@ impl SpaceElement for CosmicStack {
 
                 SpaceElement::refresh(w)
             });
+            new_header_width
         });
+        // with_program holds the Iced element lock. Resize/redraw acquire it
+        // themselves, so apply the header update after releasing that guard.
+        if let Some(width) = new_header_width {
+            self.0.resize(Size::from((width, TAB_HEIGHT)));
+            self.0.force_redraw();
+        }
         SpaceElement::refresh(&self.0);
     }
 }

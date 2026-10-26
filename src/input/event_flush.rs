@@ -2,7 +2,7 @@
 
 use smithay::reexports::wayland_server::DisplayHandle;
 
-/// Coalesces early event flushing to once per event-loop input batch.
+/// Coalesces latency-sensitive input and frame events into one early flush.
 ///
 /// The normal end-of-iteration flush is still required: housekeeping can queue
 /// more events, and the socket may temporarily be unable to accept all bytes.
@@ -19,7 +19,7 @@ impl InputEventFlush {
     pub(crate) fn flush(&mut self, display: &mut DisplayHandle) {
         if std::mem::take(&mut self.pending) {
             // Match the normal event-loop flush's error handling. Client
-            // disconnections must not terminate the compositor's input path.
+            // disconnections must not terminate the compositor's event path.
             let _ = display.flush_clients();
         }
     }
@@ -79,7 +79,7 @@ mod tests {
     }
 
     #[test]
-    fn input_free_iterations_leave_events_for_the_regular_flush() {
+    fn unrequested_iterations_leave_events_for_the_regular_flush() {
         let (mut display, mut client) = connection();
         let mut input = InputEventFlush::default();
         queue_callback(&mut display, &mut client, 2);
@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn input_batch_is_delivered_before_later_housekeeping_events() {
+    fn requested_batch_is_delivered_before_later_housekeeping_events() {
         let (mut display, mut client) = connection();
         let mut input = InputEventFlush::default();
         for id in [2, 3] {
@@ -104,7 +104,7 @@ mod tests {
         input.flush(&mut display.handle());
         read_callbacks(&mut client, &[2, 3]);
 
-        // Housekeeping after the input flush still needs the regular flush.
+        // Housekeeping after the early flush still needs the regular flush.
         queue_callback(&mut display, &mut client, 4);
         input.flush(&mut display.handle());
         assert_no_events(&mut client);

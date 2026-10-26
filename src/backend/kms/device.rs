@@ -39,7 +39,7 @@ use smithay::{
         rustix::fs::{Dev as dev_t, OFlags},
         wayland_server::DisplayHandle,
     },
-    utils::{Clock, DevPath, DeviceFd, Monotonic, Point, Transform},
+    utils::{Clock, DevPath, DeviceFd, Monotonic, Point, Time, Transform},
     wayland::{
         drm_lease::{DrmLease, DrmLeaseState},
         drm_syncobj::supports_syncobj_eventfd,
@@ -56,7 +56,6 @@ use std::{
     os::fd::OwnedFd,
     path::Path,
     sync::{Arc, RwLock, atomic::AtomicBool, mpsc::Receiver},
-    time::Duration,
 };
 
 use super::{drm_helpers, surface::Surface};
@@ -75,7 +74,7 @@ pub type LockedGbmDrmOutputManager<'a> = LockedDrmOutputManager<
     Option<(
         OutputPresentationFeedback,
         Receiver<PendingImageCopyData>,
-        Duration,
+        Option<Time<Monotonic>>,
     )>,
     DrmDeviceFd,
 >;
@@ -86,7 +85,7 @@ pub type GbmDrmOutputManager = DrmOutputManager<
     Option<(
         OutputPresentationFeedback,
         Receiver<PendingImageCopyData>,
-        Duration,
+        Option<Time<Monotonic>>,
     )>,
     DrmDeviceFd,
 >;
