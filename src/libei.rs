@@ -3,7 +3,8 @@ use std::os::unix::net::UnixStream;
 use reis::eis;
 use smithay::reexports::reis;
 
-use smithay::backend::libei::{EiInput, EiInputEvent, EiRegion};
+use smithay::backend::input::InputTime;
+use smithay::backend::libei::{EiInput, EiInputEvent, EiRegion, SpecialEvent as EiSpecialEvent};
 use smithay::input::keyboard::Keysym;
 use smithay::reexports::calloop;
 use smithay::wayland::input_method::InputMethodSeat;
@@ -129,14 +130,26 @@ pub fn setup_ei(
                         }
                     }
                     EiInputEvent::Event(event) => {
-                        use smithay::backend::input::{InputEvent, KeyboardKeyEvent};
+                        use smithay::backend::input::{Event, InputEvent, KeyboardKeyEvent};
                         match event {
                             InputEvent::Keyboard { event } => {
                                 data.inject_ei_key(
                                     connection.eis_connection(),
                                     event.key_code(),
                                     event.state(),
+                                    event.time(),
                                 );
+                            }
+                            InputEvent::Special(EiSpecialEvent::TextKeysym(event)) => {
+                                data.inject_ei_text_keysym(
+                                    connection.eis_connection(),
+                                    event.keysym,
+                                    event.state.into(),
+                                    event.time(),
+                                );
+                            }
+                            InputEvent::Special(EiSpecialEvent::TextUtf8(event)) => {
+                                data.inject_ei_text(&event.text, event.time());
                             }
                             other => {
                                 let backend_id =
@@ -152,12 +165,6 @@ pub fn setup_ei(
                                 }
                             }
                         }
-                    }
-                    EiInputEvent::TextKeysym { keysym, state } => {
-                        data.inject_ei_text_keysym(connection.eis_connection(), keysym, state);
-                    }
-                    EiInputEvent::TextUtf8 { text } => {
-                        data.inject_ei_text(&text);
                     }
                 })
             {
@@ -197,7 +204,7 @@ impl State {
     }
 
     /// Inject UTF-8 text (from an EI `ei_text` device) into the focused client.
-    pub fn inject_ei_text(&mut self, text: &str) {
+    pub fn inject_ei_text(&mut self, text: &str, time: InputTime) {
         let seat = self.common.shell.read().seats.last_active().clone();
         // Only commit through text-input when we're the active input method (no real IME)
         if !seat.input_method().has_instance() {
@@ -227,7 +234,7 @@ impl State {
         // At most ~247 keysyms fit one spare keymap (keycodes 9..=255); leave margin.
         const BATCH: usize = 240;
         for batch in keysyms.chunks(BATCH) {
-            keyboard.inject_text_keysyms(self, batch);
+            keyboard.inject_text_keysyms(self, batch, time);
         }
     }
 }

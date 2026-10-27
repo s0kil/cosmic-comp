@@ -664,7 +664,7 @@ impl State {
                                 PointerFocusTarget::WlSurface { surface, .. } => {
                                     if under_from_surface_tree(
                                         surface,
-                                        position.as_logical() - surface_loc.to_f64(),
+                                        pos.as_logical() - surface_loc.to_f64(),
                                         (0, 0),
                                         WindowSurfaceType::ALL,
                                     )
@@ -676,7 +676,7 @@ impl State {
                                 PointerFocusTarget::X11Surface { surface, .. } => {
                                     if surface
                                         .surface_under(
-                                            position.as_logical() - surface_loc.to_f64(),
+                                            pos.as_logical() - surface_loc.to_f64(),
                                             (0, 0),
                                             WindowSurfaceType::ALL,
                                         )
@@ -734,7 +734,7 @@ impl State {
                     let serial = SERIAL_COUNTER.next_serial();
                     ptr.motion(
                         self,
-                        under,
+                        new_under.clone(),
                         &PointerMotionEvent {
                             location: position.as_logical(),
                             serial,
@@ -2250,13 +2250,13 @@ impl State {
         seat: &Seat<State>,
         keycode: Keycode,
         key_state: KeyState,
+        time: InputTime,
         handle_shortcuts: bool,
     ) {
         let Some(keyboard) = seat.get_keyboard() else {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
-        let time = InputTime::now();
         let previous_modifiers = keyboard.modifier_state();
         let result = keyboard
             .input_from_source(
@@ -2300,13 +2300,14 @@ impl State {
         conn: &smithay::reexports::reis::eis::Connection,
         keycode: Keycode,
         key_state: KeyState,
+        time: InputTime,
     ) {
         let seat = self.common.shell.read().seats.last_active().clone();
         let backend_id = InputBackendId::Ei(conn.clone());
         let Some(source) = self.common.ei_keyboard_source.get(conn).copied() else {
             return;
         };
-        self.inject_source_key(source, &backend_id, &seat, keycode, key_state, true);
+        self.inject_source_key(source, &backend_id, &seat, keycode, key_state, time, true);
     }
 
     /// Inject a keysym from a libei `ei_text` device.
@@ -2315,6 +2316,7 @@ impl State {
         conn: &smithay::reexports::reis::eis::Connection,
         keysym: u32,
         key_state: KeyState,
+        time: InputTime,
     ) {
         use smithay::wayland::input_method::InputMethodSeat;
         use smithay::wayland::text_input::TextInputSeat;
@@ -2349,6 +2351,7 @@ impl State {
                     &seat,
                     keycode,
                     KeyState::Pressed,
+                    time,
                     true,
                 );
                 self.inject_source_key(
@@ -2357,6 +2360,7 @@ impl State {
                     &seat,
                     keycode,
                     KeyState::Released,
+                    time,
                     true,
                 );
                 return;
@@ -2391,7 +2395,7 @@ impl State {
         // Otherwise inject the keysym as a keycode tap via a temporary keymap delivered to just
         // the focused client (reaches non-text-input apps: terminals, games, ...). This never
         // touches the seat's own keyboard state.
-        keyboard.inject_text_keysyms(self, &[keysym]);
+        keyboard.inject_text_keysyms(self, &[keysym], time);
     }
 
     /// Determine is key event should be intercepted as a key binding, or forwarded to surface
