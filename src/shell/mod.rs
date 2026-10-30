@@ -1551,7 +1551,7 @@ pub struct OutputId(usize);
 
 impl OutputId {
     pub fn namespace_for_workspace(&self, idx: usize) -> usize {
-        self.0 | (idx << 32)
+        self.0 | (idx << (usize::BITS / 2))
     }
 }
 

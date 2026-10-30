@@ -12,7 +12,7 @@ pub struct CompList {
 impl From<CompList> for cosmic_randr_shell::List {
     fn from(CompList { infos, outputs }: CompList) -> cosmic_randr_shell::List {
         let mut list = cosmic_randr_shell::List::default();
-        for (info, output) in infos.into_iter().zip(outputs.into_iter()) {
+        for (info, output) in infos.into_iter().zip(outputs) {
             let current = list.modes.insert(cosmic_randr_shell::Mode {
                 size: (output.mode.0.0 as u32, output.mode.0.1 as u32),
                 refresh_rate: output.mode.1.unwrap_or_default(),
