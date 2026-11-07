@@ -97,6 +97,18 @@ pub fn get_config<'a, T: 'a, F: Fn(&'a InputConfig) -> Option<T>>(
     }
 }
 
+/// Resolve the direction independently of other per-device scroll settings.
+pub(crate) fn natural_scroll(
+    device_config: Option<&InputConfig>,
+    default_config: &InputConfig,
+    is_touchpad: bool,
+) -> Option<(bool, bool)> {
+    get_config(device_config, default_config, |config| {
+        config.scroll_config.as_ref()?.natural_scroll
+    })
+    .or_else(|| is_touchpad.then_some((true, true)))
+}
+
 fn config_set_error<T: std::fmt::Debug>(
     device: &InputDevice,
     setting: &str,
@@ -120,6 +132,8 @@ pub fn update_device(
     device_config: Option<&InputConfig>,
     default_config: &InputConfig,
 ) {
+    let is_touchpad = device.config_tap_finger_count() > 0;
+
     macro_rules! config {
         ($f:expr) => {
             get_config(device_config, default_config, $f)
@@ -187,16 +201,16 @@ pub fn update_device(
         {
             config_set_error(device, "scroll method", scroll, err, is_default);
         }
-        if let Some(natural) = scroll.natural_scroll
-            && let Err(err) = device.config_scroll_set_natural_scroll_enabled(natural)
-        {
-            config_set_error(device, "natural scrolling", natural, err, is_default);
-        }
         if let Some(button) = scroll.scroll_button
             && let Err(err) = device.config_scroll_set_button(button)
         {
             config_set_error(device, "scroll button", button, err, is_default);
         }
+    }
+    if let Some((natural, is_default)) = natural_scroll(device_config, default_config, is_touchpad)
+        && let Err(err) = device.config_scroll_set_natural_scroll_enabled(natural)
+    {
+        config_set_error(device, "natural scrolling", natural, err, is_default);
     }
     if let Some((tap, is_default)) = config!(|x| x.tap_config.as_ref()) {
         if let Err(err) = device.config_tap_set_enabled(tap.enabled) {
@@ -221,5 +235,94 @@ pub fn update_device(
         if let Err(err) = device.config_tap_set_drag_lock_enabled(drag_lock_state) {
             config_set_error(device, "tap-drag-lock", tap.drag_lock, err, is_default);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scroll_config(natural_scroll: Option<bool>, scroll_factor: Option<f64>) -> InputConfig {
+        InputConfig {
+            scroll_config: Some(ScrollConfig {
+                natural_scroll,
+                scroll_factor,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn touchpad_without_scroll_settings_defaults_to_natural() {
+        assert_eq!(
+            natural_scroll(None, &InputConfig::default(), true),
+            Some((true, true))
+        );
+    }
+
+    #[test]
+    fn mouse_without_scroll_settings_keeps_its_device_default() {
+        assert_eq!(natural_scroll(None, &InputConfig::default(), false), None);
+        assert_eq!(
+            natural_scroll(
+                Some(&scroll_config(None, Some(2.0))),
+                &InputConfig::default(),
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_global_direction_overrides_touchpad_default() {
+        for direction in [false, true] {
+            for is_touchpad in [false, true] {
+                assert_eq!(
+                    natural_scroll(None, &scroll_config(Some(direction), None), is_touchpad),
+                    Some((direction, true))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_device_direction_overrides_global_direction() {
+        for direction in [false, true] {
+            assert_eq!(
+                natural_scroll(
+                    Some(&scroll_config(Some(direction), None)),
+                    &scroll_config(Some(!direction), None),
+                    true
+                ),
+                Some((direction, false))
+            );
+        }
+    }
+
+    #[test]
+    fn partial_device_scroll_settings_inherit_global_direction() {
+        for direction in [false, true] {
+            assert_eq!(
+                natural_scroll(
+                    Some(&scroll_config(None, Some(2.0))),
+                    &scroll_config(Some(direction), None),
+                    true
+                ),
+                Some((direction, true))
+            );
+        }
+    }
+
+    #[test]
+    fn partial_device_scroll_settings_keep_touchpad_default() {
+        assert_eq!(
+            natural_scroll(
+                Some(&scroll_config(None, Some(2.0))),
+                &InputConfig::default(),
+                true
+            ),
+            Some((true, true))
+        );
     }
 }

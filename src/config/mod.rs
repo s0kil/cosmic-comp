@@ -43,6 +43,7 @@ use std::{
 use tracing::{error, warn};
 
 mod input_config;
+pub(crate) use input_config::natural_scroll;
 pub mod key_bindings;
 mod types;
 

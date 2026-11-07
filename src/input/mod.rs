@@ -11,6 +11,7 @@ use crate::{
             cosmic_keystate_from_smithay, cosmic_modifiers_eq_smithay,
             cosmic_modifiers_from_smithay,
         },
+        natural_scroll,
     },
     input::{
         gestures::{GestureState, SwipeAction},
@@ -1278,13 +1279,13 @@ impl State {
                         );
                         // Decide on action if first update
                         if first_update {
-                            let mut natural_scroll = false;
-                            if let Some(scroll_config) =
-                                &self.common.config.cosmic_conf.input_touchpad.scroll_config
-                                && let Some(natural) = scroll_config.natural_scroll
-                            {
-                                natural_scroll = natural;
-                            }
+                            let config = &self.common.config.cosmic_conf;
+                            let natural_scroll = natural_scroll(
+                                config.input_devices.get(&event.device().name()),
+                                &config.input_touchpad,
+                                true,
+                            )
+                            .is_some_and(|(natural, _)| natural);
                             activate_action = match gesture_state.fingers {
                                 3 => None, // TODO: 3 finger gestures
                                 4 => {
