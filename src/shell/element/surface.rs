@@ -1,7 +1,10 @@
 use crate::{
     backend::render::{
         element::AsGlowRenderer,
-        wayland::{SurfaceRenderElement, push_render_elements_from_surface_tree},
+        wayland::{
+            SurfaceRenderElement, push_render_elements_from_surface_tree,
+            snapshot_render_elements_from_surface_tree,
+        },
     },
     shell::focus::target::PointerFocusTarget,
     wayland::handlers::{
@@ -23,8 +26,11 @@ use smithay::{
         drm::DrmNode,
         input::InputTime,
         renderer::{
-            ImportAll, Renderer, buffer_has_alpha,
-            element::{Kind, RenderElementStates, surface::KindEvaluation},
+            ContextId, ImportAll, Renderer, buffer_has_alpha,
+            element::{
+                Kind, RenderElementStates,
+                surface::{KindEvaluation, WaylandSurfaceRenderElementSnapshot},
+            },
             utils::RendererSurfaceStateUserData,
         },
     },
@@ -924,6 +930,33 @@ impl CosmicSurface {
             }
             WindowSurface::X11(_) => {}
         }
+    }
+
+    /// Retain the exact plain fullscreen surface tree for import outside the
+    /// scene lock. The regular path remains responsible for clipping/effects.
+    pub(crate) fn snapshot_fullscreen_render_elements<R>(
+        &self,
+        context_id: ContextId<R::TextureId>,
+        location: Point<i32, Physical>,
+        scale: Scale<f64>,
+        scanout_node: Option<DrmNode>,
+    ) -> Vec<WaylandSurfaceRenderElementSnapshot<R>>
+    where
+        R: Renderer,
+        R::TextureId: Clone + 'static,
+    {
+        self.wl_surface()
+            .map(|surface| {
+                snapshot_render_elements_from_surface_tree(
+                    context_id,
+                    &surface,
+                    location,
+                    scale,
+                    1.0,
+                    scanout_kind_eval(Some(true), scanout_node, 1.0),
+                )
+            })
+            .unwrap_or_default()
     }
 
     pub fn push_render_elements<R>(

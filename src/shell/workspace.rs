@@ -31,7 +31,9 @@ use indexmap::IndexSet;
 use keyframe::{ease, functions::EaseInOutCubic};
 use smallvec::SmallVec;
 use smithay::backend::drm::DrmNode;
-use smithay::backend::renderer::element::{Kind, NamespacedElement};
+use smithay::backend::renderer::element::{
+    Kind, NamespacedElement, surface::WaylandSurfaceRenderElementSnapshot,
+};
 use smithay::output::WeakOutput;
 use smithay::utils::user_data::UserDataMap;
 use smithay::{
@@ -1615,6 +1617,46 @@ impl Workspace {
             }),
             _ => None,
         }
+    }
+
+    /// Snapshot the steady, focused fullscreen case without touching the GPU.
+    /// Returning `None` keeps transitions and the desktop on the regular path.
+    pub(crate) fn snapshot_fullscreen_render_elements<R>(
+        &self,
+        renderer: &R,
+        last_active_seat: &Seat<State>,
+        scale: f64,
+        scanout_node: Option<DrmNode>,
+    ) -> Option<Vec<WaylandSurfaceRenderElementSnapshot<R>>>
+    where
+        R: AsGlowRenderer,
+        R::TextureId: Clone + 'static,
+    {
+        if !matches!(
+            self.focus_stack.get(last_active_seat).last(),
+            Some(FocusTarget::Fullscreen(_))
+        ) || self
+            .fullscreen_surfaces
+            .iter()
+            .any(|fullscreen| fullscreen.start_at.is_some() || fullscreen.ended_at.is_some())
+        {
+            return None;
+        }
+        let fullscreen = self.get_fullscreen(last_active_seat)?;
+        if !fullscreen.alive() {
+            return None;
+        }
+        let location = self
+            .fullscreen_geometry_for(fullscreen)
+            .loc
+            .as_logical()
+            .to_physical_precise_round(scale);
+        Some(fullscreen.surface.snapshot_fullscreen_render_elements(
+            renderer.context_id(),
+            location,
+            scale.into(),
+            scanout_node,
+        ))
     }
 
     #[profiling::function]

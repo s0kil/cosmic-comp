@@ -1,7 +1,9 @@
 use smithay::{
     backend::renderer::{
-        ImportAll, Renderer,
-        element::surface::{KindEvaluation, WaylandSurfaceRenderElement},
+        ContextId, ImportAll, Renderer,
+        element::surface::{
+            KindEvaluation, WaylandSurfaceRenderElement, WaylandSurfaceRenderElementSnapshot,
+        },
         utils::RendererSurfaceStateUserData,
     },
     reexports::wayland_server::protocol::wl_surface,
@@ -18,6 +20,62 @@ use crate::backend::render::{
 
 pub mod blur_effect;
 pub mod clipped_surface;
+
+/// Capture a plain surface tree without importing its buffers.
+///
+/// Fullscreen rendering uses this while holding the scene lock and imports the
+/// retained snapshots only after releasing that lock. Effects and clipping keep
+/// using the general rendering path below.
+pub fn snapshot_render_elements_from_surface_tree<R>(
+    context_id: ContextId<R::TextureId>,
+    main_surface: &wl_surface::WlSurface,
+    location: impl Into<Point<i32, Physical>>,
+    scale: impl Into<Scale<f64>>,
+    alpha: f32,
+    kind: impl Into<KindEvaluation>,
+) -> Vec<WaylandSurfaceRenderElementSnapshot<R>>
+where
+    R: Renderer,
+    R::TextureId: Clone + 'static,
+{
+    let location = location.into().to_f64();
+    let scale = scale.into();
+    let kind = kind.into();
+    let mut snapshots = Vec::new();
+
+    compositor::with_surface_tree_downward(
+        main_surface,
+        location,
+        |_, states, location| {
+            let view = states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .and_then(|data| data.lock().unwrap().view());
+            match view {
+                Some(view) => {
+                    TraversalAction::DoChildren(*location + view.offset.to_f64().to_physical(scale))
+                }
+                None => TraversalAction::SkipChildren,
+            }
+        },
+        |surface, states, location| {
+            if let Some(snapshot) = WaylandSurfaceRenderElementSnapshot::from_surface(
+                context_id.clone(),
+                surface,
+                states,
+                *location,
+                alpha,
+                kind.eval(states),
+            ) {
+                let location = *location + snapshot.view().offset.to_f64().to_physical(scale);
+                snapshots.push(snapshot.with_location(location));
+            }
+        },
+        |_, _, _| true,
+    );
+
+    snapshots
+}
 
 render_elements! {
     pub SurfaceRenderElement<R> where R: AsGlowRenderer + ImportAll, R::TextureId: Send;

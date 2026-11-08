@@ -29,7 +29,7 @@ use crate::{
     shell::{
         CosmicMappedRenderElement, OutputId, OverviewMode, SeatExt, Trigger, WorkspaceDelta,
         WorkspaceRenderElement,
-        element::CosmicMappedKey,
+        element::{CosmicMappedKey, window::CosmicWindowRenderElement},
         focus::{FocusTarget, Stage, render_input_order, target::WindowGroup},
         grabs::{SeatMenuGrabState, SeatMoveGrabState},
         layout::tiling::ANIMATION_DURATION,
@@ -735,6 +735,7 @@ where
     WorkspaceRenderElement<R>: RenderElement<R>,
 {
     let mut elements = Vec::<CosmicElement<R>>::new();
+    let mut deferred_fullscreens = Vec::new();
 
     let shell_ref = shell.read();
     let seats = shell_ref.seats.iter().cloned().collect::<Vec<_>>();
@@ -822,16 +823,25 @@ where
         CropRenderElement::from_element(
             RescaleRenderElement::from_element(
                 element,
-                focal_point
-                    .as_logical()
-                    .to_physical(output.current_scale().fractional_scale())
-                    .to_i32_round(),
+                focal_point.as_logical().to_physical(scale).to_i32_round(),
                 zoom_scale,
             ),
             scale,
             Rectangle::from_size(output_size),
         )
     };
+
+    // Keep complex layouts/effects on their existing rendering path. In the
+    // steady fullscreen case the expensive buffer import can happen after the
+    // scene lock has been released, using an immutable surface snapshot.
+    let defer_fullscreen = scanout_node.is_some()
+        && previous.is_none()
+        && element_filter == ElementFilter::All
+        && matches!(overview.0, OverviewMode::None)
+        && resize_indicator.is_none()
+        && is_active_space
+        && !move_active
+        && zoom_scale == 1.0;
 
     render_input_order::<()>(&shell, output, previous, current, element_filter, |stage| {
         match stage {
@@ -1052,34 +1062,182 @@ where
                 );
             }
             Stage::Workspace { workspace, offset } => {
-                workspace.render(
-                    renderer,
-                    last_active_seat,
-                    !move_active && is_active_space,
-                    overview.clone(),
-                    resize_indicator.clone(),
-                    active_hint,
-                    theme.cosmic(),
-                    scanout_node,
-                    &mut |elem| {
-                        if let Some(elem) = crop_to_output(elem) {
-                            elements.push(CosmicElement::Workspace(
-                                RelocateRenderElement::from_element(
-                                    elem,
-                                    offset.to_physical_precise_round(scale),
-                                    Relocate::Relative,
-                                ),
-                            ));
-                        }
-                    },
-                );
+                if defer_fullscreen
+                    && let Some(snapshots) = workspace.snapshot_fullscreen_render_elements(
+                        renderer,
+                        last_active_seat,
+                        scale,
+                        scanout_node,
+                    )
+                {
+                    deferred_fullscreens.push((elements.len(), (snapshots, offset)));
+                } else {
+                    workspace.render(
+                        renderer,
+                        last_active_seat,
+                        !move_active && is_active_space,
+                        overview.clone(),
+                        resize_indicator.clone(),
+                        active_hint,
+                        theme.cosmic(),
+                        scanout_node,
+                        &mut |elem| {
+                            if let Some(elem) = crop_to_output(elem) {
+                                elements.push(CosmicElement::Workspace(
+                                    RelocateRenderElement::from_element(
+                                        elem,
+                                        offset.to_physical_precise_round(scale),
+                                        Relocate::Relative,
+                                    ),
+                                ));
+                            }
+                        },
+                    );
+                }
             }
         };
 
         ControlFlow::Continue(())
     })?;
 
+    finish_scene_elements(
+        shell,
+        elements,
+        deferred_fullscreens,
+        |(snapshots, offset)| {
+            import_visible_surfaces(
+                snapshots,
+                Rectangle::from_size(output_size),
+                |snapshot| snapshot.geometry(scale),
+                |snapshot| {
+                    let Some(element) =
+                        snapshot.import(renderer).map_err(RenderError::Rendering)?
+                    else {
+                        return Ok(None);
+                    };
+                    let element: SurfaceRenderElement<R> = element.into();
+                    let element = CosmicWindowRenderElement::from(element);
+                    Ok(crop_to_output(element.into()).map(|element| {
+                        CosmicElement::Workspace(RelocateRenderElement::from_element(
+                            element,
+                            offset.to_physical_precise_round(scale),
+                            Relocate::Relative,
+                        ))
+                    }))
+                },
+            )
+        },
+    )
+}
+
+/// Cull individual captured surfaces after traversal, so an off-output parent
+/// never prevents a visible descendant from being considered for import.
+fn import_visible_surfaces<P, E, Err>(
+    snapshots: Vec<P>,
+    output_geometry: Rectangle<i32, Physical>,
+    geometry: impl Fn(&P) -> Rectangle<i32, Physical>,
+    mut import: impl FnMut(P) -> Result<Option<E>, Err>,
+) -> Result<Vec<E>, Err> {
+    let mut elements = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        if geometry(&snapshot).intersection(output_geometry).is_some()
+            && let Some(element) = import(snapshot)?
+        {
+            elements.push(element);
+        }
+    }
     Ok(elements)
+}
+
+/// Drop the scene guard before materializing any deferred surfaces. Reverse
+/// insertion preserves their original order, including consecutive empty slots.
+fn finish_scene_elements<G, E, P, Err>(
+    scene_guard: G,
+    mut elements: Vec<E>,
+    deferred: Vec<(usize, P)>,
+    mut materialize: impl FnMut(P) -> Result<Vec<E>, Err>,
+) -> Result<Vec<E>, Err> {
+    drop(scene_guard);
+    for (index, pending) in deferred.into_iter().rev() {
+        let imported = materialize(pending)?;
+        elements.splice(index..index, imported);
+    }
+    Ok(elements)
+}
+
+#[cfg(test)]
+mod scene_import_tests {
+    use super::{finish_scene_elements, import_visible_surfaces};
+    use smithay::utils::{Physical, Rectangle};
+
+    #[test]
+    fn materializes_after_unlock_and_preserves_scene_order() {
+        let scene = parking_lot::RwLock::new(());
+        let result = finish_scene_elements(
+            scene.read(),
+            vec!["cursor", "overlay", "background"],
+            vec![(2, vec!["popup"]), (2, vec!["fullscreen", "subsurface"])],
+            |pending| {
+                assert!(
+                    scene.try_write().is_some(),
+                    "scene remained locked during import"
+                );
+                Ok::<_, ()>(pending)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            [
+                "cursor",
+                "overlay",
+                "popup",
+                "fullscreen",
+                "subsurface",
+                "background"
+            ]
+        );
+    }
+
+    #[test]
+    fn import_failure_aborts_the_scene() {
+        let mut imports = 0;
+        let result = finish_scene_elements((), vec![1], vec![(1, 2), (1, 3)], |_| {
+            imports += 1;
+            Err::<Vec<i32>, _>("import failed")
+        });
+        assert_eq!(result, Err("import failed"));
+        assert_eq!(imports, 1);
+    }
+
+    #[test]
+    fn off_output_parent_does_not_suppress_visible_descendant() {
+        // These are the flattened snapshots after surface-tree traversal. A
+        // child may extend beyond its parent; only its own bounds determine
+        // whether the expensive importer is called.
+        let snapshots: Vec<(&str, Rectangle<i32, Physical>)> = vec![
+            (
+                "parent",
+                Rectangle::new((-200, 0).into(), (100, 100).into()),
+            ),
+            ("child", Rectangle::new((-10, 5).into(), (40, 40).into())),
+            ("outside", Rectangle::new((110, 0).into(), (20, 20).into())),
+            ("sibling", Rectangle::new((50, 50).into(), (20, 20).into())),
+        ];
+        let mut imported = Vec::new();
+        let visible = import_visible_surfaces(
+            snapshots,
+            Rectangle::from_size((100, 100).into()),
+            |snapshot| snapshot.1,
+            |(id, _)| {
+                imported.push(id);
+                Ok::<_, ()>(Some(id))
+            },
+        )
+        .unwrap();
+        assert_eq!(imported, ["child", "sibling"]);
+        assert_eq!(visible, imported);
+    }
 }
 
 fn session_lock_elements<R>(
