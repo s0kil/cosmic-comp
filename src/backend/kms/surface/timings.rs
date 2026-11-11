@@ -9,6 +9,19 @@ use tracing::{debug, error};
 const BASE_SAFETY_MARGIN: Duration = Duration::from_millis(3);
 const SAMPLE_TIME_WINDOW: usize = 5;
 
+/// Bound cursor-only VRR deferral by both the display's minimum frequency and
+/// the 30 Hz fallback. Never ask for a deadline faster than the active mode.
+pub(super) fn minimum_refresh_interval(min_hz: Option<u32>, refresh: Duration) -> Duration {
+    const SAFETY_MARGIN: u32 = 2;
+    let maximum_hz = 1.0 / refresh.as_secs_f64();
+    let target_hz = min_hz
+        .filter(|hz| *hz > 0 && f64::from(*hz) <= maximum_hz.ceil())
+        .and_then(|hz| hz.checked_add(SAFETY_MARGIN))
+        .unwrap_or(30)
+        .max(30);
+    Duration::from_secs_f64(1.0 / f64::from(target_hz)).max(refresh)
+}
+
 pub struct Timings {
     refresh_interval_ns: Option<NonZeroU64>,
     min_refresh_interval_ns: Option<NonZeroU64>,
@@ -412,6 +425,35 @@ impl Timings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn minimum_refresh_deadline_respects_edid_and_mode_bounds() {
+        use super::minimum_refresh_interval;
+        use std::time::Duration;
+
+        let refresh = Duration::from_secs_f64(1.0 / 144.0);
+        for (minimum, target) in [
+            (None, 30.0),
+            (Some(0), 30.0),
+            (Some(24), 30.0),
+            (Some(30), 32.0),
+            (Some(40), 42.0),
+            (Some(48), 50.0),
+            (Some(60), 62.0),
+            (Some(200), 30.0),
+            (Some(u32::MAX), 30.0),
+        ] {
+            assert_eq!(
+                minimum_refresh_interval(minimum, refresh),
+                Duration::from_secs_f64(1.0 / target),
+                "minimum={minimum:?}",
+            );
+        }
+        let slow_mode = Duration::from_secs_f64(1.0 / 24.0);
+        assert_eq!(minimum_refresh_interval(None, slow_mode), slow_mode);
+        let sixty_hz = Duration::from_secs_f64(1.0 / 60.0);
+        assert_eq!(minimum_refresh_interval(Some(60), sixty_hz), sixty_hz);
+    }
+
     use super::*;
 
     fn timings() -> Timings {

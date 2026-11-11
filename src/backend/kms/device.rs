@@ -22,7 +22,7 @@ use smithay::{
         },
         drm::{
             DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType,
-            compositor::{FrameError, FrameFlags},
+            compositor::{FrameError, FrameFlags, PrimaryPlaneElement},
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutputManager, LockedDrmOutputManager},
         },
@@ -924,11 +924,26 @@ impl LockedDevice<'_> {
                 };
 
                 let mut compositor = compositor.lock().unwrap();
-                compositor.render_frame(renderer, &elements, CLEAR_COLOR, FrameFlags::empty())?;
-                if let Err(err) = compositor.commit_frame()
-                    && !matches!(err, FrameError::EmptyFrame)
+                let result = compositor.render_frame(
+                    renderer,
+                    &elements,
+                    CLEAR_COLOR,
+                    FrameFlags::empty(),
+                )?;
+                if result.needs_sync()
+                    && let PrimaryPlaneElement::Swapchain(element) = &result.primary_element
                 {
-                    return Err(err.into());
+                    element.sync.wait()?;
+                }
+                let replaced_pending = compositor.pending_frame().is_some();
+                match compositor.commit_frame() {
+                    Ok(()) => {
+                        if let Some(surface) = self.inner.surfaces.get(crtc) {
+                            surface.forced_commit_completed(replaced_pending);
+                        }
+                    }
+                    Err(FrameError::EmptyFrame) => {}
+                    Err(err) => return Err(err.into()),
                 }
             }
         }

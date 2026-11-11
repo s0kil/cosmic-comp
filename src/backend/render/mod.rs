@@ -1100,15 +1100,41 @@ where
         ControlFlow::Continue(())
     })?;
 
+    // Framebuffer effects may need pixels behind their visible geometry. Be
+    // conservative rather than culling input to an effect before it renders.
+    let occlusion_enabled = !elements.iter().any(Element::is_framebuffer_effect);
     finish_scene_elements(
         shell,
         elements,
         deferred_fullscreens,
-        |(snapshots, offset)| {
+        |(snapshots, offset), above| {
+            let output_geometry = Rectangle::from_size(output_size);
+            let opaque_regions = |element: &CosmicElement<R>| {
+                if !occlusion_enabled {
+                    return Vec::new();
+                }
+                let geometry = element.geometry(scale.into());
+                element
+                    .opaque_regions(scale.into())
+                    .into_iter()
+                    .filter_map(|mut region| {
+                        region.loc += geometry.loc;
+                        region
+                            .intersection(geometry)
+                            .and_then(|region| region.intersection(output_geometry))
+                    })
+                    .collect::<Vec<_>>()
+            };
             import_visible_surfaces(
                 snapshots,
-                Rectangle::from_size(output_size),
-                |snapshot| snapshot.geometry(scale),
+                output_geometry,
+                above.iter().flat_map(&opaque_regions).collect(),
+                |snapshot| {
+                    let mut geometry = snapshot.geometry(scale);
+                    geometry.loc += offset.to_physical_precise_round(scale);
+                    geometry
+                },
+                opaque_regions,
                 |snapshot| {
                     let Some(element) =
                         snapshot.import(renderer).map_err(RenderError::Rendering)?
@@ -1131,38 +1157,60 @@ where
 }
 
 /// Cull individual captured surfaces after traversal, so an off-output parent
-/// never prevents a visible descendant from being considered for import.
+/// never prevents a visible descendant from being considered for import. Only
+/// successfully materialized elements can hide later surfaces.
 fn import_visible_surfaces<P, E, Err>(
     snapshots: Vec<P>,
     output_geometry: Rectangle<i32, Physical>,
+    mut opaque_regions: Vec<Rectangle<i32, Physical>>,
     geometry: impl Fn(&P) -> Rectangle<i32, Physical>,
+    element_opaque_regions: impl Fn(&E) -> Vec<Rectangle<i32, Physical>>,
     mut import: impl FnMut(P) -> Result<Option<E>, Err>,
 ) -> Result<Vec<E>, Err> {
     let mut elements = Vec::with_capacity(snapshots.len());
+    let mut visible = Vec::new();
     for snapshot in snapshots {
-        if geometry(&snapshot).intersection(output_geometry).is_some()
-            && let Some(element) = import(snapshot)?
-        {
+        let Some(bounds) = geometry(&snapshot).intersection(output_geometry) else {
+            continue;
+        };
+        if !opaque_regions.is_empty() {
+            visible.clear();
+            visible.push(bounds);
+            visible =
+                Rectangle::subtract_rects_many_in_place(visible, opaque_regions.iter().copied());
+            if visible.is_empty() {
+                continue;
+            }
+        }
+        if let Some(element) = import(snapshot)? {
+            opaque_regions.extend(element_opaque_regions(&element));
             elements.push(element);
         }
     }
     Ok(elements)
 }
 
-/// Drop the scene guard before materializing any deferred surfaces. Reverse
-/// insertion preserves their original order, including consecutive empty slots.
+/// Drop the scene guard before materializing any deferred surfaces. Import in
+/// front-to-back order so each group can use the actual elements above it for
+/// occlusion, preserving consecutive insertions at the same scene position.
 fn finish_scene_elements<G, E, P, Err>(
     scene_guard: G,
-    mut elements: Vec<E>,
+    elements: Vec<E>,
     deferred: Vec<(usize, P)>,
-    mut materialize: impl FnMut(P) -> Result<Vec<E>, Err>,
+    mut materialize: impl FnMut(P, &[E]) -> Result<Vec<E>, Err>,
 ) -> Result<Vec<E>, Err> {
     drop(scene_guard);
-    for (index, pending) in deferred.into_iter().rev() {
-        let imported = materialize(pending)?;
-        elements.splice(index..index, imported);
+    let mut result = Vec::with_capacity(elements.len());
+    let mut elements = elements.into_iter();
+    let mut previous_index = 0;
+    for (index, pending) in deferred {
+        result.extend(elements.by_ref().take(index - previous_index));
+        let imported = materialize(pending, &result)?;
+        result.extend(imported);
+        previous_index = index;
     }
-    Ok(elements)
+    result.extend(elements);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1177,11 +1225,12 @@ mod scene_import_tests {
             scene.read(),
             vec!["cursor", "overlay", "background"],
             vec![(2, vec!["popup"]), (2, vec!["fullscreen", "subsurface"])],
-            |pending| {
+            |pending, above| {
                 assert!(
                     scene.try_write().is_some(),
                     "scene remained locked during import"
                 );
+                assert_eq!(&above[..2], &["cursor", "overlay"]);
                 Ok::<_, ()>(pending)
             },
         )
@@ -1202,7 +1251,7 @@ mod scene_import_tests {
     #[test]
     fn import_failure_aborts_the_scene() {
         let mut imports = 0;
-        let result = finish_scene_elements((), vec![1], vec![(1, 2), (1, 3)], |_| {
+        let result = finish_scene_elements((), vec![1], vec![(1, 2), (1, 3)], |_, _| {
             imports += 1;
             Err::<Vec<i32>, _>("import failed")
         });
@@ -1228,7 +1277,9 @@ mod scene_import_tests {
         let visible = import_visible_surfaces(
             snapshots,
             Rectangle::from_size((100, 100).into()),
+            Vec::new(),
             |snapshot| snapshot.1,
+            |_| Vec::new(),
             |(id, _)| {
                 imported.push(id);
                 Ok::<_, ()>(Some(id))
@@ -1237,6 +1288,52 @@ mod scene_import_tests {
         .unwrap();
         assert_eq!(imported, ["child", "sibling"]);
         assert_eq!(visible, imported);
+    }
+
+    #[test]
+    fn opaque_elements_skip_hidden_imports_but_keep_partial_visibility() {
+        let output = Rectangle::from_size((100, 100).into());
+        let left = Rectangle::from_size((50, 100).into());
+        let right = Rectangle::new((50, 0).into(), (50, 100).into());
+        let mut imported = Vec::new();
+        let visible = import_visible_surfaces(
+            vec![
+                ("hidden", left),
+                ("visible", output),
+                ("now hidden", output),
+            ],
+            output,
+            vec![left],
+            |snapshot| snapshot.1,
+            |_| vec![right],
+            |(id, _)| {
+                imported.push(id);
+                Ok::<_, ()>(Some(id))
+            },
+        )
+        .unwrap();
+        assert_eq!(visible, ["visible"]);
+        assert_eq!(imported, visible);
+    }
+
+    #[test]
+    fn missing_import_cannot_occlude_later_surface() {
+        let output = Rectangle::from_size((100, 100).into());
+        let mut imported = Vec::new();
+        let visible = import_visible_surfaces(
+            vec!["missing", "background"],
+            output,
+            Vec::new(),
+            |_| output,
+            |_| vec![output],
+            |id| {
+                imported.push(id);
+                Ok::<_, ()>((id != "missing").then_some(id))
+            },
+        )
+        .unwrap();
+        assert_eq!(visible, ["background"]);
+        assert_eq!(imported, ["missing", "background"]);
     }
 }
 

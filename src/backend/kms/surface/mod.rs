@@ -87,7 +87,6 @@ use tracing::{error, info, trace, warn};
 use std::{
     borrow::{Borrow, BorrowMut},
     collections::{HashMap, HashSet, hash_map},
-    mem,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -98,10 +97,13 @@ use std::{
 };
 
 mod commands;
+mod queue;
 mod retry;
 mod tearing;
 mod timings;
+use self::queue::SupersededFlips;
 pub use self::timings::Timings;
+type QueueState = queue::QueueState<RegistrationToken>;
 
 use super::{drm_helpers, render::gles::GbmGlowBackend};
 
@@ -116,6 +118,7 @@ pub struct Surface {
     known_nodes: HashSet<DrmNode>,
 
     active: Arc<AtomicBool>,
+    superseded_flips: Arc<SupersededFlips>,
     pub feedback: HashMap<DrmNode, SurfaceDmabufFeedback>,
     pub(super) primary_plane_formats: FormatSet,
     overlay_plane_formats: Option<FormatSet>,
@@ -134,6 +137,7 @@ pub struct SurfaceThreadState {
     primary_node: Arc<RwLock<Option<DrmNode>>>,
     target_node: DrmNode,
     active: Arc<AtomicBool>,
+    superseded_flips: Arc<SupersededFlips>,
     vrr_mode: AdaptiveSync,
     frame_flags: FrameFlags,
     compositor: Option<GbmDrmOutput>,
@@ -180,23 +184,6 @@ pub type GbmDrmOutput = DrmOutput<
     )>,
     DrmDeviceFd,
 >;
-
-#[derive(Debug, Default)]
-pub enum QueueState {
-    #[default]
-    Idle,
-    /// A redraw is queued.
-    Queued(RegistrationToken),
-    /// We submitted a frame to the KMS and waiting for it to be presented.
-    WaitingForVBlank { redraw_needed: bool },
-    /// We did not submit anything to KMS and made a timer to fire at the estimated VBlank.
-    WaitingForEstimatedVBlank(RegistrationToken),
-    /// A redraw is queued on top of the above.
-    WaitingForEstimatedVBlankAndQueued {
-        estimated_vblank: RegistrationToken,
-        queued_render: RegistrationToken,
-    },
-}
 
 #[derive(Debug)]
 pub enum ThreadCommand {
@@ -261,6 +248,8 @@ impl Surface {
         let (tx2, rx2) = channel::<SurfaceCommand>();
         let active = Arc::new(AtomicBool::new(false));
 
+        let superseded_flips = Arc::new(SupersededFlips::default());
+        let thread_superseded_flips = superseded_flips.clone();
         let active_clone = active.clone();
         let output_clone = output.clone();
 
@@ -273,6 +262,7 @@ impl Surface {
                     target_node,
                     shell,
                     active_clone,
+                    thread_superseded_flips,
                     screen_filter,
                     tx2,
                     rx,
@@ -348,6 +338,7 @@ impl Surface {
             output: output.clone(),
             known_nodes: HashSet::new(),
             active,
+            superseded_flips,
             feedback: HashMap::new(),
             primary_plane_formats: FormatSet::default(),
             overlay_plane_formats: None,
@@ -436,6 +427,14 @@ impl Surface {
             .send(ThreadCommand::AllowFrameFlags(flag, flags));
     }
 
+    /// Record a successful blocking commit while its compositor is still locked.
+    /// The old nonblocking flip's event is still in flight, but no longer owns
+    /// the compositor's pending frame or its presentation feedback.
+    pub(super) fn forced_commit_completed(&self, replaced_pending: bool) {
+        self.superseded_flips.committed(replaced_pending);
+        self.schedule_render();
+    }
+
     pub fn suspend(&mut self) {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::Suspend(tx));
@@ -507,6 +506,7 @@ fn surface_thread(
     target_node: DrmNode,
     shell: Arc<parking_lot::RwLock<Shell>>,
     active: Arc<AtomicBool>,
+    superseded_flips: Arc<SupersededFlips>,
     screen_filter: ScreenFilter,
     thread_sender: Sender<SurfaceCommand>,
     thread_receiver: Channel<ThreadCommand>,
@@ -546,6 +546,7 @@ fn surface_thread(
         primary_node,
         target_node,
         active,
+        superseded_flips,
         compositor: None,
         frame_flags: FrameFlags::DEFAULT,
         vrr_mode: AdaptiveSync::Disabled,
@@ -637,13 +638,18 @@ fn surface_thread(
             Event::Msg(ThreadCommand::DpmsOff) => {
                 state.last_presentation_mode = PresentationMode::VSync;
                 if let Some(compositor) = state.compositor.as_mut() {
-                    if let Err(err) = compositor.with_compositor(|c| c.clear()) {
+                    if let Err(err) = compositor.with_compositor(|c| {
+                        let pending = c.pending_frame().is_some();
+                        c.clear()?;
+                        state.superseded_flips.committed(pending);
+                        Ok::<_, smithay::backend::drm::DrmError>(())
+                    }) {
                         error!("Failed to set DPMS off: {:?}", err);
                     }
                     match std::mem::replace(&mut state.state, QueueState::Idle) {
                         QueueState::Idle => {}
                         QueueState::Queued(token)
-                        | QueueState::WaitingForEstimatedVBlank(token) => {
+                        | QueueState::WaitingForEstimatedVBlank { token, .. } => {
                             state.loop_handle.remove(token);
                         }
                         QueueState::WaitingForVBlank { .. } => {
@@ -652,6 +658,7 @@ fn surface_thread(
                         QueueState::WaitingForEstimatedVBlankAndQueued {
                             estimated_vblank,
                             queued_render,
+                            ..
                         } => {
                             state.loop_handle.remove(estimated_vblank);
                             state.loop_handle.remove(queued_render);
@@ -688,17 +695,22 @@ impl SurfaceThreadState {
     fn suspend(&mut self, tx: SyncSender<()>) {
         self.last_presentation_mode = PresentationMode::VSync;
         self.active.store(false, Ordering::SeqCst);
+        // DrmOutput::drop removes this compositor and its pending frame from
+        // the manager. Its already-requested event may arrive after resume.
+        // Record it before a new compositor can submit its first frame.
+        self.superseded_flips.committed(true);
         let _ = self.compositor.take();
 
         match std::mem::replace(&mut self.state, QueueState::Idle) {
             QueueState::Idle => {}
-            QueueState::Queued(token) | QueueState::WaitingForEstimatedVBlank(token) => {
+            QueueState::Queued(token) | QueueState::WaitingForEstimatedVBlank { token, .. } => {
                 self.loop_handle.remove(token);
             }
             QueueState::WaitingForVBlank { .. } => self.timings.discard_current_frame(),
             QueueState::WaitingForEstimatedVBlankAndQueued {
                 estimated_vblank,
                 queued_render,
+                ..
             } => {
                 self.loop_handle.remove(estimated_vblank);
                 self.loop_handle.remove(queued_render);
@@ -726,14 +738,8 @@ impl SurfaceThreadState {
             Duration::from_secs_f64(1_000. / drm_helpers::calculate_refresh_rate(mode) as f64);
         self.timings.set_refresh_interval(Some(interval));
 
-        const SAFETY_MARGIN: u32 = 2; // Magic two frames margin taken from kwin to not trigger low-framerate-compensation
-        let min_min_refresh_interval = Duration::from_secs_f64(1. / 30.); // 30Hz
-        self.timings.set_min_refresh_interval(Some(
-            min_hz
-                .map(|min| Duration::from_secs_f64(1. / (min + SAFETY_MARGIN) as f64))
-                .unwrap_or(min_min_refresh_interval) // alternatively use 30Hz
-                .max(min_min_refresh_interval),
-        ));
+        self.timings
+            .set_min_refresh_interval(Some(timings::minimum_refresh_interval(min_hz, interval)));
 
         if crate::utils::env::bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
             self.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
@@ -768,32 +774,40 @@ impl SurfaceThreadState {
     #[profiling::function]
     fn on_vblank(&mut self, metadata: Option<DrmEventMetadata>, observed: Time<Monotonic>) {
         let Some(compositor) = self.compositor.as_mut() else {
+            // Events queued before suspension must not carry into the next
+            // active compositor. No pending frame can be retired here.
+            self.superseded_flips.consume();
             return;
         };
-
-        // handle edge-cases right after resume
-        if !matches!(
-            self.state,
-            QueueState::WaitingForVBlank { .. } | QueueState::Idle
-        ) {
-            match mem::replace(&mut self.state, QueueState::Idle) {
-                QueueState::WaitingForVBlank { .. } | QueueState::Idle => unreachable!(),
-                QueueState::Queued(token) | QueueState::WaitingForEstimatedVBlank(token) => {
-                    self.loop_handle.remove(token);
-                }
-                QueueState::WaitingForEstimatedVBlankAndQueued {
-                    estimated_vblank,
-                    queued_render,
-                } => {
-                    self.loop_handle.remove(estimated_vblank);
-                    self.loop_handle.remove(queued_render);
-                }
+        let waiting = self.state.expects_vblank();
+        let (completed, pending) = compositor.with_compositor(|compositor| {
+            // Keep checking ownership and completing it under the same lock
+            // used by the main thread's blocking commit.
+            let completed = if self
+                .superseded_flips
+                .may_complete(compositor.pending_frame().is_some())
+            {
+                compositor.frame_submitted_with_result()
+            } else {
+                None
+            };
+            if completed.is_some() {
+                self.superseded_flips
+                    .submitted(compositor.pending_frame().is_some());
             }
-        }
-        if matches!(self.state, QueueState::Idle) {
+            (completed, compositor.pending_frame().is_some())
+        });
+        let Some(completed) = completed else {
+            // A stale event cannot cancel queued render/estimated timers or
+            // retire a newer pending frame. Recover only a genuinely lost owner.
+            if self.state.recover_missing_completion(pending) {
+                self.timings.discard_current_frame();
+                self.last_presentation_mode = PresentationMode::VSync;
+                let _ = self.vblank_frame.take();
+                self.queue_redraw(false);
+            }
             return;
-        }
-
+        };
         let now = self.clock.now();
         let presentation_time = match metadata.as_ref().map(|data| &data.time) {
             Some(DrmEventTime::Monotonic(tp)) => Some(*tp),
@@ -805,10 +819,7 @@ impl SurfaceThreadState {
         let _ = self.vblank_frame.take();
 
         // Preserve the completed frame even if submitting a queued successor fails.
-        let Some(completed) = compositor.frame_submitted_with_result() else {
-            return;
-        };
-        let next_frame_pending = compositor.with_pending_frame(|frame| frame.is_some());
+        let next_frame_pending = pending;
         let retry = if let Err(err) = completed.next_frame_result {
             warn!(?err, "Failed to submit queued frame after completion");
             true
@@ -825,6 +836,12 @@ impl SurfaceThreadState {
             presentation_time.map(Into::into),
             observed,
         );
+        if !waiting {
+            // The pending KMS owner can outlive a scheduler reset (e.g. a
+            // failed DPMS clear). Do not attribute an empty/retried render's
+            // timing interval to that older presentation.
+            self.timings.discard_current_frame();
+        }
         self.timings
             .presented(timing.presented, timing.display_phase);
 
@@ -888,16 +905,9 @@ impl SurfaceThreadState {
             }
         }
 
-        let redraw_needed = match mem::replace(&mut self.state, QueueState::Idle) {
-            QueueState::Idle => unreachable!(),
-            QueueState::Queued(_) => unreachable!(),
-            QueueState::WaitingForVBlank { redraw_needed } => redraw_needed,
-            QueueState::WaitingForEstimatedVBlank(_) => unreachable!(),
-            QueueState::WaitingForEstimatedVBlankAndQueued { .. } => unreachable!(),
-        };
-
-        if next_frame_pending {
-            self.state = QueueState::WaitingForVBlank { redraw_needed };
+        let (redraw_needed, obsolete_timers) = self.state.completed(next_frame_pending);
+        for timer in obsolete_timers.into_iter().flatten() {
+            self.loop_handle.remove(timer);
         }
         if retry
             || redraw_needed
@@ -917,18 +927,10 @@ impl SurfaceThreadState {
     }
 
     #[profiling::function]
-    fn on_estimated_vblank(&mut self, force: bool) {
-        match mem::replace(&mut self.state, QueueState::Idle) {
-            QueueState::Idle => unreachable!(),
-            QueueState::Queued(_) => unreachable!(),
-            QueueState::WaitingForVBlank { .. } => unreachable!(),
-            QueueState::WaitingForEstimatedVBlank(_) => (),
-            // The timer fired just in front of a redraw.
-            QueueState::WaitingForEstimatedVBlankAndQueued { queued_render, .. } => {
-                self.state = QueueState::Queued(queued_render);
-                return;
-            }
-        }
+    fn on_estimated_vblank(&mut self) {
+        let Some(force) = self.state.estimated_vblank() else {
+            return;
+        };
 
         self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
 
@@ -958,7 +960,7 @@ impl SurfaceThreadState {
 
         if !force {
             match &self.state {
-                QueueState::Idle | QueueState::WaitingForEstimatedVBlank(_) => {}
+                QueueState::Idle | QueueState::WaitingForEstimatedVBlank { .. } => {}
 
                 // A redraw is already queued.
                 QueueState::Queued(_) | QueueState::WaitingForEstimatedVBlankAndQueued { .. } => {
@@ -1009,31 +1011,8 @@ impl SurfaceThreadState {
             })
             .expect("Failed to schedule render");
 
-        match &self.state {
-            QueueState::Idle => {
-                self.state = QueueState::Queued(token);
-            }
-            QueueState::WaitingForEstimatedVBlank(estimated_vblank) => {
-                self.state = QueueState::WaitingForEstimatedVBlankAndQueued {
-                    estimated_vblank: *estimated_vblank,
-                    queued_render: token,
-                };
-            }
-            QueueState::Queued(old_token) if force => {
-                self.loop_handle.remove(*old_token);
-                self.state = QueueState::Queued(token);
-            }
-            QueueState::WaitingForEstimatedVBlankAndQueued {
-                estimated_vblank,
-                queued_render,
-            } if force => {
-                self.loop_handle.remove(*queued_render);
-                self.state = QueueState::WaitingForEstimatedVBlankAndQueued {
-                    estimated_vblank: *estimated_vblank,
-                    queued_render: token,
-                };
-            }
-            _ => unreachable!(),
+        if let Some(old_token) = self.state.queue_render(token, force) {
+            self.loop_handle.remove(old_token);
         }
     }
 
@@ -1406,7 +1385,15 @@ impl SurfaceThreadState {
                     elem.sync.wait()?;
                 }
 
-                match compositor.queue_frame(feedback) {
+                let queued = compositor.with_compositor(|compositor| {
+                    let result = compositor.queue_frame(feedback);
+                    if result.is_ok() {
+                        self.superseded_flips
+                            .submitted(compositor.pending_frame().is_some());
+                    }
+                    result
+                });
+                match queued {
                     x @ Ok(()) | x @ Err(FrameError::EmptyFrame) => {
                         self.timings.submitted_for_presentation(&self.clock);
 
@@ -1426,21 +1413,9 @@ impl SurfaceThreadState {
                                 direct_scanout,
                                 "Frame submitted"
                             );
-                            let new_state = QueueState::WaitingForVBlank {
-                                redraw_needed: false,
-                            };
-                            match mem::replace(&mut self.state, new_state) {
-                                QueueState::Idle => unreachable!(),
-                                QueueState::Queued(_) => (),
-                                QueueState::WaitingForVBlank { .. } => unreachable!(),
-                                QueueState::WaitingForEstimatedVBlank(estimated_vblank)
-                                | QueueState::WaitingForEstimatedVBlankAndQueued {
-                                    estimated_vblank,
-                                    ..
-                                } => {
-                                    self.loop_handle.remove(estimated_vblank);
-                                }
-                            };
+                            if let Some(estimated_vblank) = self.state.submitted() {
+                                self.loop_handle.remove(estimated_vblank);
+                            }
                         }
 
                         let now = self.clock.now();
@@ -1508,18 +1483,8 @@ impl SurfaceThreadState {
         target_presentation_time: Option<Time<Monotonic>>,
         force: bool,
     ) {
-        match mem::take(&mut self.state) {
-            QueueState::Idle => unreachable!(),
-            QueueState::Queued(_) => (),
-            QueueState::WaitingForVBlank { .. } => unreachable!(),
-            QueueState::WaitingForEstimatedVBlank(token)
-            | QueueState::WaitingForEstimatedVBlankAndQueued {
-                estimated_vblank: token,
-                ..
-            } => {
-                self.state = QueueState::WaitingForEstimatedVBlank(token);
-                return;
-            }
+        if self.state.reuse_estimated_vblank(force) {
+            return;
         }
 
         let now = self.clock.now();
@@ -1534,11 +1499,11 @@ impl SurfaceThreadState {
         let token = self
             .loop_handle
             .insert_source(timer, move |_, _, data| {
-                data.on_estimated_vblank(force);
+                data.on_estimated_vblank();
                 TimeoutAction::Drop
             })
             .unwrap();
-        self.state = QueueState::WaitingForEstimatedVBlank(token);
+        self.state = QueueState::WaitingForEstimatedVBlank { token, force };
     }
 
     fn update_mirroring(&mut self, mirroring_output: Option<Output>) {
